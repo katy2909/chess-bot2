@@ -1,4 +1,4 @@
-vkbottle
+vkbottle==4.10.0
+aiohttp==3.9.0
 httpx
-aiohttp
 loguru
