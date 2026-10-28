@@ -1,0 +1,4 @@
+vkbottle
+httpx
+aiohttp
+loguru
