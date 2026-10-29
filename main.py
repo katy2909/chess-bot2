@@ -47,7 +47,7 @@ from vkbottle.api import API
 # ⚠️ ЗАПОЛНИТЕ ПЕРЕМЕННЫЕ ⚠️
 # =====================================================================
 
-VK_TOKEN = os.getenv("VK_TOKEN")
+VK_TOKEN = os.getenv("BOT_TOKEN")
 TEAM_ID = "pHf9ZSwg"
 
 # 👇 Впишите ники руководителей и админов клуба (регистр не важен)
