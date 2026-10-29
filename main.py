@@ -1056,7 +1056,7 @@ def register_handlers(bot: Bot):
                 is_valid_for_new_nick = await check_token_valid(old_token, username)
                 if not is_valid_for_new_nick:
                     await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}.\n⚠,
+                        f"✅ Успешно! Вы привязаны как {username}.\n⚠",
                         keyboard=get_main_keyboard())
                     return
                 else:
