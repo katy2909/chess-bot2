@@ -44,28 +44,15 @@ from vkbottle.http import SingleAiohttpClient
 from vkbottle.api import API
 
 # =====================================================================
-# ⚠️ ЗАПОЛНИТЕ ПЕРЕМЕННЫЕ ⚠️
+# ⚠️ ЗАПОЛНИТЕ ДВЕ ПЕРЕМЕННЫЕ ⚠️
 # =====================================================================
 VK_TOKEN = "vk1.a.puFDEZeb25347jnBEOwzhWKmW3y9tDNwk1gelv-RXOjSSXQcq-tVXE2YFqo-P5RWvCbr7thfQH4sDBNVZp1cuMQkrWMxRJRTQhFm_7aYdCt9bBoZktKTYcTk-uBI_C8c_-qjPdHY86CCwEH1I2EciPKroPeFhVihv17ldAvMSaw5qybW8_deMOdKW4oXhTvPZWlv__6e3KoX454m3qBFOA"
 TEAM_ID = "pHf9ZSwg"
-
-# 👇 Впишите ники руководителей и админов клуба (регистр не важен)
-LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
-# =====================================================================
-
-# =====================================================================
-# 🏆 НАСТРОЙКИ МИНИ-ЧЕМПИОНАТА
-# =====================================================================
-CHAMP_KEYWORDS = ["PolyStation"]
 # =====================================================================
 
 DB_PATH = "bot.db"
 tournament_cache = {}
 waiting_for_nick = set()
-waiting_for_token = set()
-waiting_for_member_nick = set()
-pending_member_target = {}
-champ_overall_cache = {"data": [], "timestamp": 0}
 
 
 # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
@@ -82,13 +69,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (vk_id INTEGER PRIMARY KEY, lichess_username TEXT, lichess_token TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS token_cache
-                 (username TEXT PRIMARY KEY, token TEXT)''')
-    c.execute("PRAGMA table_info(users)")
-    columns = [info[1] for info in c.fetchall()]
-    if 'lichess_token' not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN lichess_token TEXT")
+                 (vk_id INTEGER PRIMARY KEY, lichess_username TEXT)''')
     conn.commit()
     conn.close()
 
@@ -102,68 +83,25 @@ def get_user_lichess(vk_id):
     return row[0] if row else None
 
 
-def get_user_token(vk_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT lichess_token FROM users WHERE vk_id=?", (vk_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
 def save_user(vk_id, lichess_username):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT vk_id FROM users WHERE vk_id=?", (vk_id,))
-    if c.fetchone():
-        c.execute("UPDATE users SET lichess_username=? WHERE vk_id=?", (lichess_username, vk_id))
-    else:
-        c.execute("INSERT INTO users (vk_id, lichess_username) VALUES (?, ?)", (vk_id, lichess_username))
+    c.execute("INSERT OR REPLACE INTO users VALUES (?, ?)", (vk_id, lichess_username))
     conn.commit()
     conn.close()
-
-
-def save_user_token(vk_id, token):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET lichess_token=? WHERE vk_id=?", (token, vk_id))
-    conn.commit()
-    conn.close()
-    username = get_user_lichess(vk_id)
-    if username:
-        save_token_cache(username, token)
-
-
-def save_token_cache(username, token):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO token_cache (username, token) VALUES (?, ?)", (username.lower(), token))
-    conn.commit()
-    conn.close()
-
-
-def get_token_from_cache(username):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT token FROM token_cache WHERE username=?", (username.lower(),))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
 
 
 # --- LICHESS API ---
-async def fetch_lichess_json(url, token=None):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+async def fetch_lichess_json(url):
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.get(url)
         resp.raise_for_status()
         return resp.json()
 
 
-async def fetch_lichess_ndjson(url, token=None):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+async def fetch_lichess_ndjson(url):
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.get(url)
         resp.raise_for_status()
         results = []
         for line in resp.text.strip().split('\n'):
@@ -178,20 +116,6 @@ async def check_user_exists(username):
         try:
             resp = await client.get(url)
             return resp.status_code == 200
-        except Exception:
-            return False
-
-
-async def check_token_valid(token, expected_username):
-    url = "https://lichess.org/api/account"
-    headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("username", "").lower() == expected_username.lower()
-            return False
         except Exception:
             return False
 
@@ -242,76 +166,6 @@ async def get_all_team_tournaments():
     return tournaments
 
 
-# --- ЛОГИКА МИНИ-ЧЕМПИОНАТА ---
-def is_champ_stage(tournament):
-    name = tournament.get('fullName', tournament.get('name', '')).lower()
-    return any(keyword.lower() in name for keyword in CHAMP_KEYWORDS)
-
-
-def get_stage_number(tournament):
-    name = tournament.get('fullName', tournament.get('name', ''))
-    match = re.search(r'(\d+\.\d+)', name)
-    if match:
-        return match.group(1)
-    match = re.search(r'(\d+)(?:st|nd|rd|th)', name, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return None
-
-
-def get_sorted_champ_stages(all_tournaments):
-    finished = [t for t in all_tournaments if t.get('status') == 30 and is_champ_stage(t)]
-    finished.sort(key=lambda x: x.get('startsAt', 0))
-    return finished
-
-
-def get_points(rank):
-    if rank == 1:
-        return 25
-    elif rank == 2:
-        return 18
-    elif rank == 3:
-        return 15
-    elif rank == 4:
-        return 12
-    elif rank == 5:
-        return 11
-    elif rank == 6:
-        return 10
-    elif rank == 7:
-        return 9
-    elif rank == 8:
-        return 8
-    elif rank == 9:
-        return 7
-    elif rank == 10:
-        return 6
-    elif 11 <= rank <= 15:
-        return 3
-    elif 16 <= rank <= 20:
-        return 2
-    elif rank >= 21:
-        return 1
-    return 0
-
-
-# --- РАСЧЕТ ПЕРИОДОВ ---
-def get_period_dates(period_type):
-    current_year = datetime.now().year
-    if period_type == "autumn":
-        start = date(current_year, 9, 1)
-        end = date(current_year, 12, 15)
-    else:
-        start = date(current_year, 2, 1)
-        end = date(current_year, 5, 15)
-    return start, end
-
-
-# --- ПРОВЕРКА ПРАВ РУКОВОДИТЕЛЯ ---
-async def is_club_leader(username):
-    return username.lower() in [name.lower() for name in LEADER_USERNAMES]
-
-
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
@@ -319,122 +173,10 @@ def get_main_keyboard():
     keyboard.row()
     keyboard.add(Text("🧩 Статистика задач", payload={"cmd": "menu_puzzles"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("📅 Статистика за периоды", payload={"cmd": "menu_periods"}), color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
     keyboard.add(Text("🏆 Статистика клуба", payload={"cmd": "menu_club"}), color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("👥 Статистика участника", payload={"cmd": "view_member_stats"}),
-                 color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.SECONDARY)
-    keyboard.row()
-    keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_periods_keyboard():
-    keyboard = Keyboard(one_time=False, inline=False)
-    keyboard.add(Text("🍂 Осенний период (1 сен - 15 дек)", payload={"cmd": "period_stats", "type": "autumn"}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🌸 Весенний период (1 фев - 15 мая)", payload={"cmd": "period_stats", "type": "spring"}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_member_period_keyboard():
-    keyboard = Keyboard(one_time=False, inline=False)
-    keyboard.add(Text("🍂 Осенний период", payload={"cmd": "member_period", "type": "autumn"}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🌸 Весенний период", payload={"cmd": "member_period", "type": "spring"}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_champ_menu_keyboard():
-    keyboard = Keyboard(one_time=False, inline=False)
-    keyboard.add(Text("📊 Общая таблица", payload={"cmd": "champ_overall", "page": 0}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("📅 Список этапов", payload={"cmd": "champ_stages", "page": 0}), color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_overall_keyboard(page, has_next):
-    keyboard = Keyboard(one_time=False, inline=False)
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "champ_overall", "page": page - 1}))
-    if has_next:
-        nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "champ_overall", "page": page + 1}))
-
-    if nav_buttons:
-        for btn in nav_buttons:
-            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
-        keyboard.row()
-
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_stages_keyboard(stages, page):
-    keyboard = Keyboard(one_time=False, inline=False)
-    per_page = 5
-    start_idx = page * per_page
-    end_idx = start_idx + per_page
-
-    for i, s in enumerate(stages[start_idx:end_idx]):
-        global_idx = start_idx + i + 1
-        stage_num = get_stage_number(s)
-        prefix = f"Этап {stage_num}: " if stage_num else f"{global_idx}. "
-        short_name = s['name'][:20] + "..." if len(s['name']) > 20 else s['name']
-
-        keyboard.add(Text(f"{prefix}{short_name}",
-                          payload={"cmd": "champ_view_stage", "idx": start_idx + i, "page": page, "res_page": 0}),
-                     color=KeyboardButtonColor.SECONDARY)
-        keyboard.row()
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "champ_stages", "page": page - 1}))
-    if end_idx < len(stages):
-        nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "champ_stages", "page": page + 1}))
-
-    if nav_buttons:
-        for btn in nav_buttons:
-            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
-        keyboard.row()
-
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_stage_results_keyboard(idx, page, res_page, has_next):
-    keyboard = Keyboard(one_time=False, inline=False)
-    nav_buttons = []
-    if res_page > 0:
-        nav_buttons.append(
-            Text("⬅️ Назад", payload={"cmd": "champ_view_stage", "idx": idx, "page": page, "res_page": res_page - 1}))
-    if has_next:
-        nav_buttons.append(
-            Text("Вперед ➡️", payload={"cmd": "champ_view_stage", "idx": idx, "page": page, "res_page": res_page + 1}))
-
-    if nav_buttons:
-        for btn in nav_buttons:
-            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
-        keyboard.row()
-
-    keyboard.add(Text("🔙 К списку этапов", payload={"cmd": "champ_stages", "page": page}),
-                 color=KeyboardButtonColor.SECONDARY)
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
 
 
@@ -527,24 +269,16 @@ def get_tournament_results_keyboard(t_format, tid, list_type, list_page, res_pag
 
 
 # --- СОЗДАНИЕ БОТА ---
-# Создаем цикл событий (нужно для Python 3.9)
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# Теперь безопасно создаем коннектор
-connector = TCPConnector(ssl=False, loop=loop)
+connector = TCPConnector(ssl=False)
 http_client = SingleAiohttpClient(connector=connector)
 api = API(token=VK_TOKEN, http_client=http_client)
 bot = Bot(api=api)
 
 
-# --- ВСЕ ОБРАБОТЧИКИ (ГЛОБАЛЬНО) ---
+# --- ОБРАБОТЧИКИ ---
 @bot.on.message(text=["Начать", "start", "/start"])
 async def start_handler(message: Message):
     waiting_for_nick.discard(message.from_id)
-    waiting_for_token.discard(message.from_id)
-    waiting_for_member_nick.discard(message.from_id)
-    pending_member_target.pop(message.from_id, None)
     user = get_user_lichess(message.from_id)
     if user:
         await message.answer(f"👋 Привет! Ты привязан как {user}.\n\nВыбери нужный раздел в меню ниже:",
@@ -555,244 +289,8 @@ async def start_handler(message: Message):
                              keyboard=Keyboard(one_time=True).get_json())
 
 
-@bot.on.message(payload_contains={"cmd": "set_token"})
-async def set_token_handler(message: Message):
-    user = get_user_lichess(message.from_id)
-    if not user:
-        await message.answer("Сначала привяжите ник (напишите 'Начать').")
-        return
-    waiting_for_nick.discard(message.from_id)
-    waiting_for_member_nick.discard(message.from_id)
-    pending_member_target.pop(message.from_id, None)
-    waiting_for_token.add(message.from_id)
-    await message.answer(
-        f"🔑 Отправьте ваш персональный токен Lichess.\n\n"
-        f"Он должен принадлежать вашему аккаунту: {user}.\n"
-        f"Его можно создать здесь: https://lichess.org/account/oauth/token/create\n",
-        keyboard=Keyboard(one_time=True).get_json()
-    )
-
-
-@bot.on.message(payload_contains={"cmd": "view_member_stats"})
-async def view_member_stats_handler(message: Message):
-    user = get_user_lichess(message.from_id)
-    if not user:
-        await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
-        return
-    is_leader = await is_club_leader(user)
-    if not is_leader:
-        await message.answer("❌ Эта функция доступна только руководителям и администраторам клуба.")
-        return
-    waiting_for_nick.discard(message.from_id)
-    waiting_for_token.discard(message.from_id)
-    pending_member_target.pop(message.from_id, None)
-    waiting_for_member_nick.add(message.from_id)
-    await message.answer("Введите ник участника клуба на Lichess, чтобы посмотреть его статистику за выбранный период:",
-                         keyboard=Keyboard(one_time=True).get_json())
-
-
-@bot.on.message(payload_contains={"cmd": "member_period"})
-async def member_period_handler(message: Message):
-    payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
-    period_type = payload_data.get("type", "autumn")
-
-    target_username = pending_member_target.get(message.from_id)
-    if not target_username:
-        await message.answer("Сначала выберите участника через «👥 Статистика участника» в главном меню.")
-        return
-
-    start_date, end_date = get_period_dates(period_type)
-    period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
-
-    await message.answer(
-        f"⏳ Собираю статистику для {target_username} за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
-
-    try:
-        user_token = get_token_from_cache(target_username)
-
-        user_data = await fetch_lichess_json(f"https://lichess.org/api/user/{target_username.lower()}")
-        played_tournaments = await fetch_lichess_ndjson(
-            f"https://lichess.org/api/user/{target_username.lower()}/tournament/played")
-
-        period_tourn_count = 0
-        period_tourn_wins = 0
-        for t in played_tournaments:
-            starts_at = t.get('tournament', {}).get('startsAt', 0)
-            t_date = datetime.fromtimestamp(starts_at / 1000).date()
-            if start_date <= t_date <= end_date:
-                period_tourn_count += 1
-                if t.get('player', {}).get('rank') == 1:
-                    period_tourn_wins += 1
-
-        puzzles_solved = 0
-        puzzles_won = 0
-        start_rating = None
-        end_rating = None
-        if user_token:
-            try:
-                puzzles_data = await fetch_lichess_ndjson("https://lichess.org/api/puzzle/activity", token=user_token)
-                for entry in puzzles_data:
-                    try:
-                        event_ts = entry.get("date", 0)
-                        event_date = datetime.fromtimestamp(event_ts / 1000).date()
-                        if start_date <= event_date <= end_date:
-                            is_win = entry.get("win", False)
-                            if is_win:
-                                puzzles_won += 1
-                                puzzles_solved += 1
-                            else:
-                                puzzles_solved += 1
-                            rating = entry.get("puzzle", {}).get("rating")
-                            if rating:
-                                if start_rating is None:
-                                    start_rating = rating
-                                end_rating = rating
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-        perfs = user_data.get('perfs', {})
-        rating_lines = []
-        for mode in ['bullet', 'blitz', 'rapid', 'classical', 'puzzle']:
-            if mode in perfs and 'rating' in perfs[mode]:
-                prov = " (provisional)" if perfs[mode].get('prov') else ""
-                rating_lines.append(f"• {mode.capitalize()}: {perfs[mode]['rating']}{prov}")
-
-        text = f"👤 Статистика игрока {target_username}\n"
-        text += f"📅 Период: {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
-
-        text += f"🏆 Турниры за период:\n"
-        text += f"• Участий: {period_tourn_count}\n"
-        text += f"• Побед (1 место): {period_tourn_wins}\n\n"
-
-        if puzzles_solved > 0:
-            text += f"🧩 Задачи за период (использован токен аккаунта):\n"
-            text += f"• Правильно: {puzzles_won}\n"
-            text += f"• Неправильно: {puzzles_solved - puzzles_won}\n"
-            if start_rating and end_rating:
-                text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
-            text += "\n"
-        else:
-            text += f"🧩 Задачи за период: нет данных (токен не найден)\n\n"
-
-        if rating_lines:
-            text += f"📈 Текущие рейтинги:\n" + "\n".join(rating_lines) + "\n"
-
-        await message.answer(text, keyboard=get_member_period_keyboard())
-
-    except Exception as e:
-        await message.answer(f"⚠️ Ошибка при сборе статистики: {e}", keyboard=get_member_period_keyboard())
-
-
-@bot.on.message(payload_contains={"cmd": "menu_periods"})
-async def menu_periods_handler(message: Message):
-    user = get_user_lichess(message.from_id)
-    if not user:
-        await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
-        return
-    await message.answer("📅 Выберите период, за который хотите посмотреть статистику:", keyboard=get_periods_keyboard())
-
-
-@bot.on.message(payload_contains={"cmd": "period_stats"})
-async def period_stats_handler(message: Message):
-    payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
-    period_type = payload_data.get("type", "autumn")
-    user = get_user_lichess(message.from_id)
-
-    if not user:
-        await message.answer("Сначала привяжите аккаунт.")
-        return
-
-    user_token = get_token_from_cache(user)
-    if not user_token:
-        await message.answer(
-            f"Для статистики за периоды нужен токен Lichess для ника {user}. Нажмите «🔑 Мой токен Lichess» в главном меню.",
-            keyboard=get_periods_keyboard())
-        return
-
-    start_date, end_date = get_period_dates(period_type)
-    period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
-
-    await message.answer(
-        f"⏳ Собираю статистику за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
-
-    try:
-        puzzles_data = await fetch_lichess_ndjson(
-            "https://lichess.org/api/puzzle/activity",
-            token=user_token
-        )
-
-        puzzles_solved = 0
-        puzzles_won = 0
-        start_rating = None
-        end_rating = None
-
-        for entry in puzzles_data:
-            try:
-                event_ts = entry.get("date", 0)
-                event_date = datetime.fromtimestamp(event_ts / 1000).date()
-
-                if start_date <= event_date <= end_date:
-                    is_win = entry.get("win", False)
-                    if is_win:
-                        puzzles_won += 1
-                        puzzles_solved += 1
-                    else:
-                        puzzles_solved += 1
-
-                    rating = entry.get("puzzle", {}).get("rating")
-                    if rating:
-                        if start_rating is None:
-                            start_rating = rating
-                        end_rating = rating
-            except Exception:
-                continue
-
-        played_tournaments = await fetch_lichess_ndjson(
-            f"https://lichess.org/api/user/{user.lower()}/tournament/played")
-        tourn_count = 0
-        tourn_wins = 0
-
-        for t in played_tournaments:
-            starts_at = t.get('tournament', {}).get('startsAt', 0)
-            t_date = datetime.fromtimestamp(starts_at / 1000).date()
-
-            if start_date <= t_date <= end_date:
-                tourn_count += 1
-                if t.get('player', {}).get('rank') == 1:
-                    tourn_wins += 1
-
-        if puzzles_solved == 0 and tourn_count == 0:
-            await message.answer(
-                f"За {period_name.lower()} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}) у вас нет активности.",
-                keyboard=get_periods_keyboard())
-            return
-
-        text = f"📊 Статистика за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
-
-        if puzzles_solved > 0:
-            text += f"🧩 Задачи:\n"
-            text += f"• Правильно решено: {puzzles_won}\n"
-            text += f"• Неправильно решено: {puzzles_solved - puzzles_won}\n"
-            if start_rating and end_rating:
-                text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
-            text += "\n"
-
-        text += f"🏆 Турниры:\n"
-        text += f"• Сыграно турниров: {tourn_count}\n"
-        text += f"• Побед (1 место): {tourn_wins}\n"
-
-        await message.answer(text, keyboard=get_periods_keyboard())
-
-    except Exception as e:
-        await message.answer(f"⚠️ Ошибка при сборе статистики: {e}", keyboard=get_periods_keyboard())
-
-
 @bot.on.message(payload_contains={"cmd": "back_main"})
 async def back_main_handler(message: Message):
-    pending_member_target.pop(message.from_id, None)
-    waiting_for_member_nick.discard(message.from_id)
     user = get_user_lichess(message.from_id)
     await message.answer(f"👋 Главное меню\n\nВы привязаны как: {user}\nВыберите, что хотите посмотреть:",
                          keyboard=get_main_keyboard())
@@ -801,9 +299,6 @@ async def back_main_handler(message: Message):
 @bot.on.message(payload_contains={"cmd": "change_nick"})
 async def change_nick_handler(message: Message):
     waiting_for_nick.add(message.from_id)
-    waiting_for_token.discard(message.from_id)
-    waiting_for_member_nick.discard(message.from_id)
-    pending_member_target.pop(message.from_id, None)
     await message.answer("🔗 Регистрация\n\nОтправьте ваш новый ник на Lichess:",
                          keyboard=Keyboard(one_time=True).get_json())
 
@@ -844,11 +339,9 @@ async def menu_puzzles_handler(message: Message):
     if not lichess_user:
         await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
         return
-
-    user_token = get_token_from_cache(lichess_user)
     await message.answer("⏳ Загружаю статистику задач...")
     try:
-        user_data = await fetch_lichess_json(f"https://lichess.org/api/user/{lichess_user}", token=user_token)
+        user_data = await fetch_lichess_json(f"https://lichess.org/api/user/{lichess_user}")
         puzzle_perf = user_data.get('perfs', {}).get('puzzle', {})
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}")
@@ -1037,27 +530,6 @@ async def any_text_handler(message: Message, text: str):
     if message.payload:
         return
 
-    if message.from_id in waiting_for_token:
-        token = text.strip()
-        if not token.startswith("lip_"):
-            await message.answer(
-                "❌ Токен должен начинаться с `lip_`. Попробуйте еще раз или напишите /start для отмены.")
-            return
-
-        user = get_user_lichess(message.from_id)
-        await message.answer("⏳ Проверяю токен...")
-        is_valid = await check_token_valid(token, user)
-        if not is_valid:
-            await message.answer(
-                f"❌ Токен недействителен или не принадлежит аккаунту {user}. Попробуйте другой токен или напишите /start для отмены.")
-            return
-
-        save_user_token(message.from_id, token)
-        waiting_for_token.discard(message.from_id)
-        await message.answer(f"✅ Токен успешно привязан! Теперь статистика задач будет доступна в полном объеме.",
-                             keyboard=get_main_keyboard())
-        return
-
     if message.from_id in waiting_for_nick:
         username = text.strip()
         if not username or len(username) > 30 or " " in username:
@@ -1070,44 +542,9 @@ async def any_text_handler(message: Message, text: str):
             await message.answer(f"❌ Игрок {username} не найден на Lichess.\nПопробуйте другой ник:")
             return
 
-        old_token = get_user_token(message.from_id)
         save_user(message.from_id, username)
         waiting_for_nick.discard(message.from_id)
-
-        if old_token:
-            is_valid_for_new_nick = await check_token_valid(old_token, username)
-            if not is_valid_for_new_nick:
-                await message.answer(
-                    f"✅ Успешно! Вы привязаны как {username}.\n",
-                    keyboard=get_main_keyboard())
-                return
-            else:
-                await message.answer(
-                    f"✅ Успешно! Вы привязаны как {username}. Ваш токен привязан к этому аккаунту.",
-                    keyboard=get_main_keyboard())
-                return
-
         await message.answer(f"✅ Успешно! Вы привязаны как {username}.", keyboard=get_main_keyboard())
-        return
-
-    if message.from_id in waiting_for_member_nick:
-        target_username = text.strip()
-        if not target_username or len(target_username) > 30 or " " in target_username:
-            await message.answer("❌ Некорректный ник. Попробуйте еще раз (без пробелов):")
-            return
-
-        await message.answer("⏳ Проверяю ник на Lichess...")
-        if not await check_user_exists(target_username):
-            await message.answer(f"❌ Игрок {target_username} не найден на Lichess.\nПопробуйте другой ник:")
-            return
-
-        pending_member_target[message.from_id] = target_username
-        waiting_for_member_nick.discard(message.from_id)
-
-        await message.answer(
-            f"Участник: {target_username}\nВыберите период для просмотра статистики:",
-            keyboard=get_member_period_keyboard()
-        )
         return
 
     await message.answer("Пожалуйста, пользуйтесь кнопками в меню ниже, или напишите 'Начать'.",
