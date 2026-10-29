@@ -46,7 +46,9 @@ from vkbottle.api import API
 # =====================================================================
 # ⚠️ ЗАПОЛНИТЕ ПЕРЕМЕННЫЕ ⚠️
 # =====================================================================
-VK_TOKEN = "vk1.a.puFDEZeb25347jnBEOwzhWKmW3y9tDNwk1gelv-RXOjSSXQcq-tVXE2YFqo-P5RWvCbr7thfQH4sDBNVZp1cuMQkrWMxRJRTQhFm_7aYdCt9bBoZktKTYcTk-uBI_C8c_-qjPdHY86CCwEH1I2EciPKroPeFhVihv17ldAvMSaw5qybW8_deMOdKW4oXhTvPZWlv__6e3KoX454m3qBFOA"
+import os
+
+VK_TOKEN = os.getenv("VK_TOKEN")
 TEAM_ID = "pHf9ZSwg"
 
 # 👇 Впишите ники руководителей и админов клуба (регистр не важен)
