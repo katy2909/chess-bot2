@@ -46,9 +46,25 @@ from vkbottle.api import API
 # =====================================================================
 # ⚠️ ЗАПОЛНИТЕ ПЕРЕМЕННЫЕ ⚠️
 # =====================================================================
+# 🔐 НАСТРОЙКИ ДОСТУПА
+# =====================================================================
+SECRET_CODE = "chess-bot"
+# =====================================================================
 
+# ... ваши существующие переменные ...
+
+# ... остальные переменные ...
 VK_TOKEN = os.getenv("BOT_TOKEN")
 TEAM_ID = "pHf9ZSwg"
+waiting_for_code = set()  # Пользователи, которым нужно ввести секретный код
+waiting_for_nick = set()
+waiting_for_table = set()
+pending_member_target = {}
+champ_overall_cache = {"data": [], "timestamp": 0}
+table_cache = {}
+last_table_message = {}
+# =====================================================================
+
 
 # 👇 Впишите ники руководителей и админов клуба (регистр не важен)
 LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
@@ -681,14 +697,16 @@ def register_handlers(bot: Bot):
         waiting_for_member_nick.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
+
         user = get_user_lichess(message.from_id)
         if user:
+            # Если уже привязан — показываем меню
             await message.answer(f"👋 Привет! Ты привязан как {user}.\n\nВыбери нужный раздел в меню ниже:",
                                  keyboard=get_main_keyboard())
         else:
-            waiting_for_nick.add(message.from_id)
-            await message.answer("👋 Привет! Это бот клуба.\n\nПожалуйста, отправьте ваш ник на Lichess для привязки:",
-                                 keyboard=Keyboard(one_time=True).get_json())
+            # Если не привязан — требуем секретный код
+            waiting_for_code.add(message.from_id)
+            await message.answer("🔒 Это закрытый бот шахматного клуба.\n\nПожалуйста, введите секретный код доступа:")
 
     @bot.on.message(payload_contains={"cmd": "set_token"})
     async def set_token_handler(message: Message):
@@ -1331,6 +1349,21 @@ def register_handlers(bot: Bot):
         if message.payload:
             return
 
+        @bot.on.message(text="<text>")
+        async def any_text_handler(message: Message, text: str):
+            if message.payload:
+                return
+
+            # --- НОВЫЙ БЛОК: Проверка секретного кода ---
+            if message.from_id in waiting_for_code:
+                if text.strip().lower() == SECRET_CODE.lower():
+                    waiting_for_code.discard(message.from_id)
+                    waiting_for_nick.add(message.from_id)
+                    await message.answer("✅ Код верный! Отлично.\n\nТеперь отправьте ваш ник на Lichess для привязки:")
+                else:
+                    await message.answer("❌ Неверный код доступа. Попробуйте еще раз или напишите /start для отмены.")
+                return  # Прерываем обработку, чтобы не шло дальше
+            
         if message.from_id in waiting_for_token:
             token = text.strip()
             if not token.startswith("lip_"):
