@@ -1399,15 +1399,7 @@ def register_handlers(bot: Bot):
                 await message.answer(f"❌ Игрок {username} не найден на Lichess.\nПопробуйте другой ник:")
                 return
 
-            # Проверка членства в клубе
-            is_leader = await is_club_leader(username)
-            if not is_leader:
-                await message.answer("⏳ Проверяю, состоите ли вы в нашем клубе...")
-                in_club = await check_is_club_member(username)
-                if not in_club:
-                    await message.answer(
-                        f"❌ Игрок {username} не найден в нашем клубе на Lichess.\n\nЭтот бот доступен только для участников клуба. Пожалуйста, вступите в клуб по ссылке:\nhttps://lichess.org/team/{TEAM_ID}\n\nПосле вступления попробуйте снова отправить ваш ник:")
-                    return
+            
 
             old_token = get_user_token(message.from_id)
             save_user(message.from_id, username)
