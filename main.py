@@ -690,7 +690,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
 
 # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
 def register_handlers(bot: Bot):
-    @bot.on.message(text=["Начать", "start", "/start"])
+    @bot.on.message(text=["Начать","начать","Start", "start","/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
@@ -1363,7 +1363,7 @@ def register_handlers(bot: Bot):
                 else:
                     await message.answer("❌ Неверный код доступа. Попробуйте еще раз или напишите /start для отмены.")
                 return  # Прерываем обработку, чтобы не шло дальше
-            
+
         if message.from_id in waiting_for_token:
             token = text.strip()
             if not token.startswith("lip_"):
