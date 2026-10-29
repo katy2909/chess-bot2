@@ -656,7 +656,7 @@ def register_handlers(bot: Bot):
             text += f"• Побед (1 место): {period_tourn_wins}\n\n"
 
             if puzzles_solved > 0:
-                text += f"🧩 Задачи за период (использован токен аккаунта):\n"
+                text += f"🧩 Задачи за период:\n"
                 text += f"• Правильно: {puzzles_won}\n"
                 text += f"• Неправильно: {puzzles_solved - puzzles_won}\n"
                 if start_rating and end_rating:
@@ -937,7 +937,7 @@ def register_handlers(bot: Bot):
         end_idx = start_idx + per_page
         page_tournaments = filtered[start_idx:end_idx]
 
-        text = f"{title} (стр. {page + 1}):\nНажмите на кнопку, чтобы увидеть результаты.\nВ скобках указано: (участники, дата)."
+        text = f"{title} (стр. {page + 1}):\nНажмите на кнопку, чтобы увидеть результаты."
         keyboard = get_paginated_tournaments_keyboard(page_tournaments, t_type, page, len(filtered) > end_idx)
         await message.answer(text, keyboard=keyboard)
 
@@ -1096,7 +1096,7 @@ def register_handlers(bot: Bot):
 async def main():
     init_db()
     print("Бот ВК запущен...")
-    # Создаём коннектор с отключенной проверкой SSL внутри работающего цикла событий
+   
     connector = TCPConnector(ssl=False)
     http_client = SingleAiohttpClient(connector=connector)
     api = API(token=VK_TOKEN, http_client=http_client)
