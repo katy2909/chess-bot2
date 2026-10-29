@@ -32,7 +32,7 @@ async def _safe_payload_check(self, event):
 
 
 PayloadRule.check = _safe_payload_check
-# -------------------------------------------------------------------------
+
 
 import os
 
@@ -64,8 +64,11 @@ tournament_cache = {}
 waiting_for_nick = set()
 waiting_for_token = set()
 waiting_for_member_nick = set()
+waiting_for_table = set()
 pending_member_target = {}
 champ_overall_cache = {"data": [], "timestamp": 0}
+table_cache = {}  # Кэш для таблиц участников
+last_table_message = {}
 
 
 # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
@@ -154,7 +157,7 @@ def get_token_from_cache(username):
 # --- LICHESS API ---
 async def fetch_lichess_json(url, token=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         return resp.json()
@@ -162,7 +165,7 @@ async def fetch_lichess_json(url, token=None):
 
 async def fetch_lichess_ndjson(url, token=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         results = []
@@ -174,7 +177,7 @@ async def fetch_lichess_ndjson(url, token=None):
 
 async def check_user_exists(username):
     url = f"https://lichess.org/api/user/{username}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
         try:
             resp = await client.get(url)
             return resp.status_code == 200
@@ -185,7 +188,7 @@ async def check_user_exists(username):
 async def check_token_valid(token, expected_username):
     url = "https://lichess.org/api/account"
     headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
         try:
             resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
@@ -198,7 +201,7 @@ async def check_token_valid(token, expected_username):
 
 async def get_club_members(team_id):
     url = f"https://lichess.org/api/team/{team_id}/users"
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         try:
             resp = await client.get(url)
             if resp.status_code != 200:
@@ -217,7 +220,7 @@ async def get_users_profiles(usernames):
         return []
     ids_str = ",".join(usernames[:300])
     url = "https://lichess.org/api/users"
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         try:
             resp = await client.post(url, data=ids_str)
             if resp.status_code == 200:
@@ -242,7 +245,7 @@ async def get_all_team_tournaments():
     return tournaments
 
 
-# --- ЛОГИКА МИНИ-ЧЕМПИОНАТА (не используется в текущем меню) ---
+# --- ЛОГИКА МИНИ-ЧЕМПИОНАТА ---
 def is_champ_stage(tournament):
     name = tournament.get('fullName', tournament.get('name', '')).lower()
     return any(keyword.lower() in name for keyword in CHAMP_KEYWORDS)
@@ -307,7 +310,7 @@ def get_period_dates(period_type):
     return start, end
 
 
-# --- ПРОВЕРКА ПРАВ РУКОВОДИТЕЛЯ (ПО СПИСКУ) ---
+# --- ПРОВЕРКА ПРАВ РУКОВОДИТЕЛЯ ---
 async def is_club_leader(username):
     return username.lower() in [name.lower() for name in LEADER_USERNAMES]
 
@@ -326,6 +329,8 @@ def get_main_keyboard():
     keyboard.add(Text("👥 Статистика участника", payload={"cmd": "view_member_stats"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
+    keyboard.add(Text("📊 Таблица участников", payload={"cmd": "table_members"}), color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
     keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.row()
@@ -339,6 +344,18 @@ def get_periods_keyboard():
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🌸 Весенний период (1 фев - 15 мая)", payload={"cmd": "period_stats", "type": "spring"}),
+                 color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
+    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
+    return keyboard.get_json()
+
+
+def get_table_period_keyboard():
+    keyboard = Keyboard(one_time=False, inline=False)
+    keyboard.add(Text("🍂 Осенний период", payload={"cmd": "table_period", "type": "autumn"}),
+                 color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
+    keyboard.add(Text("🌸 Весенний период", payload={"cmd": "table_period", "type": "spring"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
@@ -526,6 +543,134 @@ def get_tournament_results_keyboard(t_format, tid, list_type, list_page, res_pag
     return keyboard.get_json()
 
 
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ ---
+def get_ball_word(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return "балл"
+    elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "балла"
+    else:
+        return "баллов"
+
+def pluralize(n, forms):
+    """Склонение русских слов: forms = ('задача', 'задачи', 'задач')"""
+    n = abs(n) % 100
+    n1 = n % 10
+    if 10 < n < 20:
+        return forms[2]
+    if 1 < n1 < 5:
+        return forms[1]
+    if n1 == 1:
+        return forms[0]
+    return forms[2]
+
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ ---
+async def send_table_page(target, period_type, page, is_edit=False):
+    rows = table_cache.get(period_type, [])
+    per_page = 20
+    start_idx = page * per_page
+    end_idx = start_idx + per_page
+    page_rows = rows[start_idx:end_idx]
+
+    is_autumn = period_type == "autumn"
+    period_name = "🍂 Осенний период" if is_autumn else "🌸 Весенний период"
+    start_date, end_date = get_period_dates(period_type)
+    date_range = f"{start_date.strftime('%d.%m.%Y')} — {end_date.strftime('%d.%m.%Y')}"
+
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    total_puzzles = sum(r[1] for r in rows)
+    total_tourns = sum(r[2] for r in rows)
+    active_count = sum(1 for r in rows if r[1] + r[2] > 0)
+
+    # ---------- Шапка ----------
+    text = "📊Таблица активности участников\n"
+    text += f"{period_name}\n"
+    text += f"📅 {date_range}\n\n"
+
+    # ---------- Рейтинг участников ----------
+    text += f"Рейтинг участников · стр. {page + 1}/{total_pages}\n\n"
+
+    if page_rows:
+        for i, (username, puzzles, tourns) in enumerate(page_rows, start_idx + 1):
+            total = puzzles + tourns
+
+            # Склонения
+            ball_word = pluralize(total, ('балл', 'балла', 'баллов'))
+            task_word = pluralize(puzzles, ('задача', 'задачи', 'задач'))
+            tourn_word = pluralize(tourns, ('турнир', 'турнира', 'турниров'))
+
+            # Определяем префикс (медаль для топ-3, цифра для остальных)
+            if i == 1:
+                prefix = "🥇 "
+            elif i == 2:
+                prefix = "🥈 "
+            elif i == 3:
+                prefix = "🥉 "
+            else:
+                prefix = f"{i}. "
+
+            # Первая строка: Место/Медаль, Ник и Баллы
+            text += f"{prefix} {username} — {total} {ball_word}\n"
+
+            # Вторая строка: Задачи и Турниры (юникод-пробелы)
+            text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word}\n"
+    else:
+        text += "На этой странице нет участников.\n"
+
+    text += "\n" + "━" * 22 + "\n\n"
+
+    # ---------- Итоги ----------
+    total_puzzles_word = pluralize(total_puzzles, ('задача', 'задачи', 'задач'))
+    total_tourns_word = pluralize(total_tourns, ('турнир', 'турнира', 'турниров'))
+
+    text += (f"📈Всего: 🧩 {total_puzzles} {total_puzzles_word} · 🏆 {total_tourns} {total_tourns_word}\n"
+             f"👥 Участников: {len(rows)} (активных: {active_count})")
+
+    # ---------- Клавиатура ----------
+    keyboard = Keyboard(one_time=False, inline=False)
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "table_page", "type": period_type, "page": page - 1}))
+    if len(rows) > end_idx:
+        nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "table_page", "type": period_type, "page": page + 1}))
+
+    if nav_buttons:
+        for btn in nav_buttons:
+            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
+        keyboard.row()
+
+    keyboard.add(Text("🔄 Другой период", payload={"cmd": "table_members"}), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
+
+    kb_json = keyboard.get_json()
+
+
+    if is_edit:
+        prev_id = last_table_message.get(target.peer_id)
+        if prev_id is not None:
+            try:
+                await target.ctx_api.messages.edit(
+                    peer_id=target.peer_id,
+                    message_id=prev_id,
+                    message=text,
+                    keyboard=kb_json,
+                    parse_mode='HTML',
+                )
+                return
+            except Exception:
+                pass
+
+    # ---------- Отправка нового сообщения ----------
+    resp = await target.answer(text, keyboard=kb_json, parse_mode='HTML')
+    mid = None
+    if hasattr(resp, 'response') and resp.response:
+        mid = resp.response[0].message_id
+    elif isinstance(resp, list) and resp:
+        mid = getattr(resp[0], 'message_id', None)
+    if mid:
+        last_table_message[target.peer_id] = mid
+
+
 # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
 def register_handlers(bot: Bot):
     @bot.on.message(text=["Начать", "start", "/start"])
@@ -533,6 +678,7 @@ def register_handlers(bot: Bot):
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
+        waiting_for_table.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         user = get_user_lichess(message.from_id)
         if user:
@@ -551,13 +697,13 @@ def register_handlers(bot: Bot):
             return
         waiting_for_nick.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
+        waiting_for_table.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         waiting_for_token.add(message.from_id)
         await message.answer(
             f"🔑 Отправьте ваш персональный токен Lichess.\n\n"
             f"Он должен принадлежать вашему аккаунту: {user}.\n"
-            f"Его можно создать здесь: https://lichess.org/account/oauth/token/create\n"
-,
+            f"Его можно создать здесь: https://lichess.org/account/oauth/token/create\n",
             keyboard=Keyboard(one_time=True).get_json()
         )
 
@@ -573,11 +719,178 @@ def register_handlers(bot: Bot):
             return
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
+        waiting_for_table.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         waiting_for_member_nick.add(message.from_id)
         await message.answer(
             "Введите ник участника клуба на Lichess, чтобы посмотреть его статистику за выбранный период:",
             keyboard=Keyboard(one_time=True).get_json())
+
+    @bot.on.message(payload_contains={"cmd": "table_members"})
+    async def table_members_handler(message: Message):
+        user = get_user_lichess(message.from_id)
+        if not user:
+            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+            return
+        is_leader = await is_club_leader(user)
+        if not is_leader:
+            await message.answer("❌ Эта функция доступна только руководителям и администраторам клуба.")
+            return
+        waiting_for_nick.discard(message.from_id)
+        waiting_for_token.discard(message.from_id)
+        waiting_for_member_nick.discard(message.from_id)
+        pending_member_target.pop(message.from_id, None)
+        waiting_for_table.add(message.from_id)
+        await message.answer("Выберите период для таблицы участников:", keyboard=get_table_period_keyboard())
+
+    # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ СБОРА ДАННЫХ ОБ ОДНОМ ИГРОКЕ (ТОЛЬКО ДЛЯ ТАБЛИЦЫ) ---
+    async def fetch_member_data(client, username, start_date, end_date):
+        tourn_count = 0
+        puzzles_solved = 0
+
+        # 1. Запрашиваем Арены (Arena)
+        try:
+            url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played?max=1000"
+            resp = await client.get(url_arena)
+            if resp.status_code == 200:
+                for line in resp.text.strip().split('\n'):
+                    if line.strip():
+                        t = json.loads(line)
+                        starts_at = t.get('tournament', {}).get('startsAt', 0)
+                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                        if start_date <= t_date <= end_date:
+                            tourn_count += 1
+        except Exception:
+            pass
+
+        # 2. Запрашиваем Швейцарки (Swiss)
+        try:
+            url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played?max=1000"
+            resp = await client.get(url_swiss)
+            if resp.status_code == 200:
+                for line in resp.text.strip().split('\n'):
+                    if line.strip():
+                        t = json.loads(line)
+                        starts_at = t.get('tournament', {}).get('startsAt', 0)
+                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                        if start_date <= t_date <= end_date:
+                            tourn_count += 1
+        except Exception:
+            pass
+
+        # 3. Запрашиваем задачи
+        token = get_token_from_cache(username)
+        if token:
+            # Если токен есть — точные данные по дням
+            try:
+                url_p = "https://lichess.org/api/puzzle/activity"
+                headers_p = {"Authorization": f"Bearer {token}"}
+                resp = await client.get(url_p, headers=headers_p)
+                if resp.status_code == 200:
+                    for line in resp.text.strip().split('\n'):
+                        if line.strip():
+                            entry = json.loads(line)
+                            event_ts = entry.get("date", 0)
+                            event_date = datetime.fromtimestamp(event_ts / 1000).date()
+                            if start_date <= event_date <= end_date:
+                                puzzles_solved += 1
+            except Exception:
+                pass
+        else:
+            # Если токена нет — используем публичную активность (без токена)
+            try:
+                url_act = f"https://lichess.org/api/user/{username.lower()}/activity"
+                resp = await client.get(url_act)
+                if resp.status_code == 200:
+                    activities = resp.json()
+                    for act in activities:
+                        interval_start = datetime.fromtimestamp(act['interval']['start'] / 1000).date()
+                        interval_end = datetime.fromtimestamp(act['interval']['end'] / 1000).date()
+
+                        # Если интервал активности попадает в наш период
+                        if interval_start <= end_date and interval_end >= start_date:
+                            puzzles_data = act.get('puzzles', {}).get('score', {})
+                            if puzzles_data:
+                                puzzles_solved += puzzles_data.get('win', 0) + puzzles_data.get('loss', 0)
+            except Exception:
+                pass
+
+        return (username, puzzles_solved, tourn_count)
+
+    # FIX: table_period_handler вынесен из fetch_member_data на уровень соседних хэндлеров
+    @bot.on.message(payload_contains={"cmd": "table_period"})
+    async def table_period_handler(message: Message):
+        payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
+        period_type = payload_data.get("type", "autumn")
+
+        start_date, end_date = get_period_dates(period_type)
+        period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
+
+        if period_type in table_cache:
+            await send_table_page(message, period_type, 0)
+            return
+
+        await message.answer(
+            f"⏳ Собираю полный список участников клуба за {period_name}.\n"
+            f"Чем больше участников — тем дольше (обычно 15–30 сек). Подождите..."
+        )
+
+        try:
+            members = await get_club_members(TEAM_ID)
+            if not members:
+                await message.answer("❌ Не удалось получить список участников клуба.")
+                return
+
+            # Исключаем руководителей и админов
+            leader_set = {n.lower() for n in LEADER_USERNAMES}
+            members = [m for m in members if (m.get('id') or '').lower() not in leader_set]
+
+            if not members:
+                await message.answer("В клубе нет участников для отображения.")
+                return
+
+            rows = []
+
+            async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
+                sem = asyncio.Semaphore(25)
+
+                async def bounded_fetch(m):
+                    async with sem:
+                        username = m.get('id')
+                        if not username:
+                            return None
+                        try:
+                            return await fetch_member_data(client, username, start_date, end_date)
+                        except Exception:
+                            return (username, 0, 0)
+
+                results = await asyncio.gather(*(bounded_fetch(m) for m in members))
+
+            for res in results:
+                if res:
+                    username, puzzles, tourns = res
+                    rows.append((username, puzzles, tourns))
+
+            if not rows:
+                await message.answer("Не удалось собрать данные ни по одному участнику.")
+                return
+
+            # Сортировка по общей сумме баллов (задачи + турниры)
+            rows.sort(key=lambda x: (-(x[1] + x[2]), x[0].lower()))
+            table_cache[period_type] = rows
+
+            await send_table_page(message, period_type, 0)
+
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка при сборе таблицы: {e}", keyboard=get_table_period_keyboard())
+
+    @bot.on.message(payload_contains={"cmd": "table_page"})
+    async def table_page_handler(message: Message):
+        payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
+        period_type = payload_data.get("type", "autumn")
+        page = payload_data.get("page", 0)
+        # Исправлено is_callback на is_edit
+        await send_table_page(message, period_type, page, is_edit=True)
 
     @bot.on.message(payload_contains={"cmd": "member_period"})
     async def member_period_handler(message: Message):
@@ -780,6 +1093,7 @@ def register_handlers(bot: Bot):
     async def back_main_handler(message: Message):
         pending_member_target.pop(message.from_id, None)
         waiting_for_member_nick.discard(message.from_id)
+        waiting_for_table.discard(message.from_id)
         user = get_user_lichess(message.from_id)
         await message.answer(f"👋 Главное меню\n\nВы привязаны как: {user}\nВыберите, что хотите посмотреть:",
                              keyboard=get_main_keyboard())
@@ -789,6 +1103,7 @@ def register_handlers(bot: Bot):
         waiting_for_nick.add(message.from_id)
         waiting_for_token.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
+        waiting_for_table.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         await message.answer("🔗 Регистрация\n\nОтправьте ваш новый ник на Lichess:",
                              keyboard=Keyboard(one_time=True).get_json())
@@ -1056,7 +1371,7 @@ def register_handlers(bot: Bot):
                 is_valid_for_new_nick = await check_token_valid(old_token, username)
                 if not is_valid_for_new_nick:
                     await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}.\n⚠",
+                        f"✅ Успешно! Вы привязаны как {username}.\n",
                         keyboard=get_main_keyboard())
                     return
                 else:
@@ -1096,14 +1411,11 @@ def register_handlers(bot: Bot):
 async def main():
     init_db()
     print("Бот ВК запущен...")
-   
     connector = TCPConnector(ssl=False)
     http_client = SingleAiohttpClient(connector=connector)
     api = API(token=VK_TOKEN, http_client=http_client)
     bot = Bot(api=api)
-
     register_handlers(bot)
-
     await bot.run_polling()
 
 
