@@ -1349,21 +1349,22 @@ def register_handlers(bot: Bot):
         if message.payload:
             return
 
-        @bot.on.message(text="<text>")
-        async def any_text_handler(message: Message, text: str):
-            if message.payload:
-                return
+        print(f"DEBUG: Получено сообщение '{text}' от {message.from_id}")
+        print(f"DEBUG: В waiting_for_code? {message.from_id in waiting_for_code}")
 
-            # --- НОВЫЙ БЛОК: Проверка секретного кода ---
-            if message.from_id in waiting_for_code:
-                if text.strip().lower() == SECRET_CODE.lower():
-                    waiting_for_code.discard(message.from_id)
-                    waiting_for_nick.add(message.from_id)
-                    await message.answer("✅ Код верный! Отлично.\n\nТеперь отправьте ваш ник на Lichess для привязки:")
-                else:
-                    await message.answer("❌ Неверный код доступа. Попробуйте еще раз или напишите /start для отмены.")
-                return  # Прерываем обработку, чтобы не шло дальше
+        # --- 1. ПРОВЕРКА СЕКРЕТНОГО КОДА (самая первая) ---
+        if message.from_id in waiting_for_code:
+            if text.strip().lower() == SECRET_CODE.lower():
+                waiting_for_code.discard(message.from_id)
+                waiting_for_nick.add(message.from_id)
+                print(f"DEBUG: Код верный, переводим в waiting_for_nick")
+                await message.answer("✅ Код верный! Отлично.\n\nТеперь отправьте ваш ник на Lichess для привязки:")
+            else:
+                print(f"DEBUG: Код неверный: '{text.strip()}' != '{SECRET_CODE}'")
+                await message.answer("❌ Неверный код доступа. Попробуйте еще раз или напишите /start для отмены.")
+            return  # <--- ОЧЕНЬ ВАЖНО! Останавливаем функцию, чтобы не проваливаться дальше
 
+        # --- 2. ПРОВЕРКА ТОКЕНА ---
         if message.from_id in waiting_for_token:
             token = text.strip()
             if not token.startswith("lip_"):
@@ -1385,6 +1386,7 @@ def register_handlers(bot: Bot):
                                  keyboard=get_main_keyboard())
             return
 
+        # --- 3. ПРОВЕРКА НИКА (привязка) ---
         if message.from_id in waiting_for_nick:
             username = text.strip()
             if not username or len(username) > 30 or " " in username:
@@ -1396,6 +1398,16 @@ def register_handlers(bot: Bot):
             if not exists:
                 await message.answer(f"❌ Игрок {username} не найден на Lichess.\nПопробуйте другой ник:")
                 return
+
+            # Проверка членства в клубе
+            is_leader = await is_club_leader(username)
+            if not is_leader:
+                await message.answer("⏳ Проверяю, состоите ли вы в нашем клубе...")
+                in_club = await check_is_club_member(username)
+                if not in_club:
+                    await message.answer(
+                        f"❌ Игрок {username} не найден в нашем клубе на Lichess.\n\nЭтот бот доступен только для участников клуба. Пожалуйста, вступите в клуб по ссылке:\nhttps://lichess.org/team/{TEAM_ID}\n\nПосле вступления попробуйте снова отправить ваш ник:")
+                    return
 
             old_token = get_user_token(message.from_id)
             save_user(message.from_id, username)
@@ -1417,6 +1429,7 @@ def register_handlers(bot: Bot):
             await message.answer(f"✅ Успешно! Вы привязаны как {username}.", keyboard=get_main_keyboard())
             return
 
+        # --- 4. ПРОВЕРКА НИКА УЧАСТНИКА (для админов) ---
         if message.from_id in waiting_for_member_nick:
             target_username = text.strip()
             if not target_username or len(target_username) > 30 or " " in target_username:
@@ -1431,12 +1444,11 @@ def register_handlers(bot: Bot):
             pending_member_target[message.from_id] = target_username
             waiting_for_member_nick.discard(message.from_id)
 
-            await message.answer(
-                f"Участник: {target_username}\nВыберите период для просмотра статистики:",
-                keyboard=get_member_period_keyboard()
-            )
+            await message.answer(f"Участник: {target_username}\nВыберите период для просмотра статистики:",
+                                 keyboard=get_member_period_keyboard())
             return
 
+        # --- 5. ФОЛБЭК (если ничего не подошло) ---
         await message.answer("Пожалуйста, пользуйтесь кнопками в меню ниже, или напишите 'Начать'.",
                              keyboard=get_main_keyboard())
 
