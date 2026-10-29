@@ -557,7 +557,7 @@ def register_handlers(bot: Bot):
             f"🔑 Отправьте ваш персональный токен Lichess.\n\n"
             f"Он должен принадлежать вашему аккаунту: {user}.\n"
             f"Его можно создать здесь: https://lichess.org/account/oauth/token/create\n"
-            f"Поставьте галочку только на 'puzzle:read' (или оставьте пустым, если не уверены).",
+,
             keyboard=Keyboard(one_time=True).get_json()
         )
 
@@ -1056,12 +1056,12 @@ def register_handlers(bot: Bot):
                 is_valid_for_new_nick = await check_token_valid(old_token, username)
                 if not is_valid_for_new_nick:
                     await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}.\n⚠️ Ваш токен от другого аккаунта сохранен в базе, но не будет использоваться для {username}. Если нужна статистика задач, привяжите новый токен.",
+                        f"✅ Успешно! Вы привязаны как {username}.\n⚠,
                         keyboard=get_main_keyboard())
                     return
                 else:
                     await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}. Ваш токен сохранен, так как он принадлежит этому аккаунту.",
+                        f"✅ Успешно! Вы привязаны как {username}. Ваш токен привязан к этому аккаунту.",
                         keyboard=get_main_keyboard())
                     return
 
