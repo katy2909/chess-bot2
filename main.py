@@ -360,22 +360,23 @@ async def fetch_member_data(client, username, start_date, end_date):
         headers["Authorization"] = f"Bearer {token}"
 
     async def fetch_lines(url):
-        for attempt in range(3):
-            try:
-                resp = await client.get(url, headers=headers)
+        try:
+            resp = await client.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                return resp.text.strip().split('\n')
+            elif resp.status_code == 429:
+                print(f"!!! 429 ЛИМИТ для {username}")
+                await asyncio.sleep(5)
+                resp = await client.get(url, headers=headers, timeout=10.0)
                 if resp.status_code == 200:
                     return resp.text.strip().split('\n')
-                elif resp.status_code == 404:
-                    return []
-                elif resp.status_code == 429:
-                    print(f"!!! ЛИМИТ ДЛЯ {username}, ЖДЕМ 5 СЕК...")
-                    await asyncio.sleep(5)
-                else:
-                    print(f"!!! ОШИБКА {resp.status_code} для {username}")
-            except Exception as e:
-                print(f"!!! ИСКЛЮЧЕНИЕ для {username}: {e}")
-            await asyncio.sleep(1)
-        return None  # Полный провал
+            elif resp.status_code == 404:
+                return []
+            else:
+                print(f"!!! ОШИБКА {resp.status_code} для {username}")
+        except Exception as e:
+            print(f"!!! EXCEPTION для {username}: {e}")
+        return None
 
     async def get_arena():
         lines = await fetch_lines(f"https://lichess.org/api/user/{username.lower()}/tournament/played")
@@ -468,8 +469,9 @@ async def fetch_and_save_table_data(period_type):
         new_results = []
 
         async def fetch_all():
-            async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-                sem = asyncio.Semaphore(15)
+            async with httpx.AsyncClient(verify=False) as client:
+                # УМЕНЬШИЛИ ДО 2 ЧЕЛОВЕК ОДНОВРЕМЕННО, ЧТОБЫ LICHESS НЕ БЛОКИРОВАЛ
+                sem = asyncio.Semaphore(2)
 
                 async def bounded_fetch(m):
                     async with sem:
@@ -481,16 +483,21 @@ async def fetch_and_save_table_data(period_type):
                             print(str(e))
                             return None
 
-                for i in range(0, len(members), 15):
-                    batch = members[i:i + 15]
+                for i in range(0, len(members), 2):
+                    batch = members[i:i + 2]
                     batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
                     new_results.extend(batch_results)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)  # ПАУЗА 1.5 СЕК МЕЖДУ ПАЧКАМИ
 
         try:
             await asyncio.wait_for(fetch_all(), timeout=90.0)
         except asyncio.TimeoutError:
             print("=== ТАЙМАУТ! Lichess слишком долго не отвечает. Сохраняем то, что есть. ===")
+
+        # Если вообще НИ ОДИН человек не собрался, значит, Lichess полностью блокирует.
+        if not any(new_results):
+            print("=== ПОЛНЫЙ ПРОВАЛ СБОРА. НЕ СОХРАНЯЕМ НУЛИ, ОСТАВЛЯЕМ СТАРЫЕ ДАННЫЕ ===")
+            return False
 
         final_rows = []
         for m in members:
