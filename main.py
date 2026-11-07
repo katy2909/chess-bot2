@@ -728,6 +728,8 @@ def register_handlers(bot: Bot):
             c = conn.cursor()
             c.execute("SELECT username FROM token_cache")
             token_usernames = [row[0] for row in c.fetchall()]
+            print(f"=== ПУТЬ К БАЗЕ: {DB_PATH} ===")
+            print(f"=== НАЙДЕННЫЕ ТОКЕНЫ: {token_usernames} ===")
             c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
             known_names = {row[0].lower(): row[0] for row in c.fetchall()}
             conn.close()
