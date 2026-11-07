@@ -83,6 +83,7 @@ pending_member_target = {}
 
 table_cache = {}
 last_table_message = {}
+daily_puzzle_cache = {"data": None, "timestamp": 0}
 
 
 # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
@@ -169,25 +170,53 @@ def get_token_from_cache(username):
     return row[0] if row else None
 
 
-# --- LICHESS API ---
+# --- LICHESS API (С ЗАЩИТОЙ ОТ 429 ОШИБКИ) ---
 async def fetch_lichess_json(url, token=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 429:
+                    print(f"=== ЛИМИТ LICHESS (JSON)! ЖДЕМ 5 СЕКУНД... ===")
+                    await asyncio.sleep(5)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    await asyncio.sleep(5)
+                    continue
+                raise e
+            except Exception:
+                await asyncio.sleep(2)
+        return {}
 
 
 async def fetch_lichess_ndjson(url, token=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        results = []
-        for line in resp.text.strip().split('\n'):
-            if line.strip():
-                results.append(json.loads(line))
-        return results
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 429:
+                    print(f"=== ЛИМИТ LICHESS (NDJSON)! ЖДЕМ 5 СЕКУНД... ===")
+                    await asyncio.sleep(5)
+                    continue
+                resp.raise_for_status()
+                results = []
+                for line in resp.text.strip().split('\n'):
+                    if line.strip():
+                        results.append(json.loads(line))
+                return results
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    await asyncio.sleep(5)
+                    continue
+                raise e
+            except Exception:
+                await asyncio.sleep(2)
+        return []
 
 
 async def check_user_exists(username):
@@ -451,7 +480,6 @@ async def fetch_and_save_table_data(period_type):
 
 
 async def background_updater_loop():
-    """Бесконечный цикл, который обновляет таблицу каждые 24 часа."""
     await asyncio.sleep(15)
 
     while True:
@@ -470,7 +498,6 @@ async def background_updater_loop():
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
 
-    # 👇 Кнопка чемпионата теперь самая первая
     keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
                  color=KeyboardButtonColor.POSITIVE)
     keyboard.row()
@@ -487,8 +514,8 @@ def get_main_keyboard():
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
 
-    keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.POSITIVE)
-    keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.NEGATIVE)
     keyboard.row()
     keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
 
@@ -1130,15 +1157,32 @@ def register_handlers(bot: Bot):
 
     @bot.on.message(payload_contains={"cmd": "daily_puzzle"})
     async def daily_puzzle_handler(message: Message):
-        await message.answer("⏳ Загружаю задачу дня...")
+        global daily_puzzle_cache
+
+        if daily_puzzle_cache["data"] and (time.time() - daily_puzzle_cache["timestamp"] < 3600):
+            data = daily_puzzle_cache["data"]
+        else:
+            await message.answer("⏳ Загружаю задачу дня...")
+            try:
+                data = await fetch_lichess_json("https://lichess.org/api/puzzle/daily")
+                if not data:
+                    await message.answer("⚠️ Lichess временно ограничил запросы. Попробуйте через минуту.",
+                                         keyboard=get_back_to_main_keyboard())
+                    return
+
+                daily_puzzle_cache["data"] = data
+                daily_puzzle_cache["timestamp"] = time.time()
+            except Exception as e:
+                await message.answer(f"⚠️ Ошибка загрузки задачи: {e}", keyboard=get_back_to_main_keyboard())
+                return
+
         try:
-            data = await fetch_lichess_json("https://lichess.org/api/puzzle/daily")
             rating = data.get('puzzle', {}).get('rating', '?')
             themes = ", ".join(data.get('puzzle', {}).get('themes', []))
             text = f"🎯 Ежедневная задача Lichess\n\n📈 Рейтинг задачи: {rating}\n🏷️ Темы: {themes}\n\nРешить: https://lichess.org/training/daily"
             await message.answer(text, keyboard=get_back_to_main_keyboard())
         except Exception as e:
-            await message.answer(f"⚠️ Ошибка загрузки задачи: {e}", keyboard=get_back_to_main_keyboard())
+            await message.answer(f"⚠️ Ошибка: {e}", keyboard=get_back_to_main_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "menu_club"})
     async def menu_club_handler(message: Message):
@@ -1413,7 +1457,6 @@ async def main():
     bot = Bot(api=api)
     register_handlers(bot)
 
-    # Запускаем фоновое обновление таблицы
     asyncio.create_task(background_updater_loop())
 
     await bot.run_polling()
