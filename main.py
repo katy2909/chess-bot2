@@ -90,6 +90,8 @@ def format_date(ts):
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
+    print(f"=== БАЗА ДАННЫХ ИНИЦИАЛИЗИРУЕТСЯ ПО ПУТИ: {DB_PATH} ===")  # <-- ДОБАВИТЬ СЮДА
+    conn = sqlite3.connect(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
@@ -147,6 +149,16 @@ def save_user_token(vk_id, token):
 
 
 def save_token_cache(username, token):
+    print(f"DEBUG: Пытаюсь сохранить токен для {username} в базу {DB_PATH}")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO token_cache (username, token) VALUES (?, ?)", (username.lower(), token))
+        conn.commit()
+        conn.close()
+        print("DEBUG: Токен УСПЕШНО записан в базу!")
+    except Exception as e:
+        print(f"DEBUG ОШИБКА БД: {e}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO token_cache (username, token) VALUES (?, ?)", (username.lower(), token))
