@@ -175,9 +175,12 @@ def get_token_from_cache(username):
     return row[0] if row else None
 
 
-# --- LICHESS API (С ЗАЩИТОЙ ОТ 429) ---
+# --- LICHESS API (С ЗАЩИТОЙ ОТ 429 И USER-AGENT) ---
 async def fetch_lichess_json(url, token=None):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         for attempt in range(3):
             try:
@@ -198,7 +201,10 @@ async def fetch_lichess_json(url, token=None):
 
 
 async def fetch_lichess_ndjson(url, token=None):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         for attempt in range(3):
             try:
@@ -224,9 +230,10 @@ async def fetch_lichess_ndjson(url, token=None):
 
 async def check_user_exists(username):
     url = f"https://lichess.org/api/user/{username}"
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
     async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
         try:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
             return resp.status_code == 200
         except Exception:
             return False
@@ -234,7 +241,10 @@ async def check_user_exists(username):
 
 async def check_token_valid(token, expected_username):
     url = "https://lichess.org/api/account"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "User-Agent": "VK-ChessClubBot/1.0",
+        "Authorization": f"Bearer {token}"
+    }
     async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
         try:
             resp = await client.get(url, headers=headers)
@@ -248,9 +258,10 @@ async def check_token_valid(token, expected_username):
 
 async def get_club_members(team_id):
     url = f"https://lichess.org/api/team/{team_id}/users"
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         try:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
                 return []
             users = []
@@ -267,9 +278,10 @@ async def get_users_profiles(usernames):
         return []
     ids_str = ",".join(usernames[:300])
     url = "https://lichess.org/api/users"
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         try:
-            resp = await client.post(url, data=ids_str)
+            resp = await client.post(url, data=ids_str, headers=headers)
             if resp.status_code == 200:
                 return resp.json()
             return []
@@ -343,83 +355,86 @@ async def is_club_leader(username):
 # =====================================================================
 async def fetch_member_data(client, username, start_date, end_date):
     token = get_token_from_cache(username)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
-    async def safe_get(url, req_headers=None):
-        for attempt in range(3):  # 3 попытки
+    async def fetch_lines(url):
+        for attempt in range(3):
             try:
-                resp = await client.get(url, headers=req_headers)
-                if resp.status_code == 429:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.text.strip().split('\n')
+                elif resp.status_code == 404:
+                    return []
+                elif resp.status_code == 429:
                     print(f"!!! ЛИМИТ ДЛЯ {username}, ЖДЕМ 5 СЕК...")
                     await asyncio.sleep(5)
-                    continue
-                if resp.status_code == 404:
-                    return resp
-                if resp.status_code == 200:
-                    return resp
-            except Exception:
-                pass
+                else:
+                    print(f"!!! ОШИБКА {resp.status_code} для {username}")
+            except Exception as e:
+                print(f"!!! ИСКЛЮЧЕНИЕ для {username}: {e}")
             await asyncio.sleep(1)
-        raise Exception(f"Не удалось получить данные для {username}")
+        return None  # Полный провал
 
     async def get_arena():
+        lines = await fetch_lines(f"https://lichess.org/api/user/{username.lower()}/tournament/played")
+        if lines is None: return None
         count, wins = 0, 0
-        resp = await safe_get(f"https://lichess.org/api/user/{username.lower()}/tournament/played", headers)
-        if resp and resp.status_code == 200:
-            for line in resp.text.strip().split('\n'):
-                if line.strip():
-                    try:
-                        t = json.loads(line)
-                        starts_at = t.get('tournament', {}).get('startsAt', 0)
-                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date:
-                            count += 1
-                            if t.get('player', {}).get('rank') == 1: wins += 1
-                    except Exception:
-                        continue
+        for line in lines:
+            if not line.strip(): continue
+            try:
+                t = json.loads(line)
+                starts_at = t.get('tournament', {}).get('startsAt', 0)
+                t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                if start_date <= t_date <= end_date:
+                    count += 1
+                    if t.get('player', {}).get('rank') == 1: wins += 1
+            except Exception:
+                continue
         return count, wins
 
     async def get_swiss():
+        lines = await fetch_lines(f"https://lichess.org/api/user/{username.lower()}/swiss/played")
+        if lines is None: return None
         count, wins = 0, 0
-        resp = await safe_get(f"https://lichess.org/api/user/{username.lower()}/swiss/played", headers)
-        if resp and resp.status_code == 200:
-            for line in resp.text.strip().split('\n'):
-                if line.strip():
-                    try:
-                        t = json.loads(line)
-                        starts_at = t.get('tournament', {}).get('startsAt', 0)
-                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date:
-                            count += 1
-                            if t.get('player', {}).get('rank') == 1: wins += 1
-                    except Exception:
-                        continue
+        for line in lines:
+            if not line.strip(): continue
+            try:
+                t = json.loads(line)
+                starts_at = t.get('tournament', {}).get('startsAt', 0)
+                t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                if start_date <= t_date <= end_date:
+                    count += 1
+                    if t.get('player', {}).get('rank') == 1: wins += 1
+            except Exception:
+                continue
         return count, wins
 
     async def get_puzzles():
+        if not token: return 0
+        lines = await fetch_lines("https://lichess.org/api/puzzle/activity")
+        if lines is None: return None
         count = 0
-        if token:
-            resp = await safe_get("https://lichess.org/api/puzzle/activity", headers)
-            if resp and resp.status_code == 200:
-                for line in resp.text.strip().split('\n'):
-                    if line.strip():
-                        try:
-                            entry = json.loads(line)
-                            event_ts = entry.get("date", 0)
-                            event_date = datetime.fromtimestamp(event_ts / 1000).date()
-                            if start_date <= event_date <= end_date: count += 1
-                        except Exception:
-                            continue
+        for line in lines:
+            if not line.strip(): continue
+            try:
+                entry = json.loads(line)
+                event_ts = entry.get("date", 0)
+                event_date = datetime.fromtimestamp(event_ts / 1000).date()
+                if start_date <= event_date <= end_date: count += 1
+            except Exception:
+                continue
         return count
 
-    results = await asyncio.gather(get_arena(), get_swiss(), get_puzzles(), return_exceptions=True)
+    res = await asyncio.gather(get_arena(), get_swiss(), get_puzzles())
 
-    if any(isinstance(r, Exception) for r in results):
-        raise Exception(f"Ошибка при сборе для {username}")
+    if None in res:
+        raise Exception(f"Не удалось получить данные для {username}")
 
-    arena_c, arena_w = results[0] if isinstance(results[0], tuple) else (0, 0)
-    swiss_c, swiss_w = results[1] if isinstance(results[1], tuple) else (0, 0)
-    puzzles_c = results[2] if isinstance(results[2], int) else 0
+    arena_c, arena_w = res[0]
+    swiss_c, swiss_w = res[1]
+    puzzles_c = res[2]
 
     return (username, puzzles_c, arena_c + swiss_c, arena_w + swiss_w)
 
@@ -454,7 +469,6 @@ async def fetch_and_save_table_data(period_type):
 
         async def fetch_all():
             async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-                # УВЕЛИЧЕНО ДО 15 ЧЕЛОВЕК
                 sem = asyncio.Semaphore(15)
 
                 async def bounded_fetch(m):
@@ -473,7 +487,6 @@ async def fetch_and_save_table_data(period_type):
                     new_results.extend(batch_results)
                     await asyncio.sleep(1)
 
-        # ТАЙМАУТ 90 СЕКУНД
         try:
             await asyncio.wait_for(fetch_all(), timeout=90.0)
         except asyncio.TimeoutError:
@@ -1392,24 +1405,6 @@ def register_handlers(bot: Bot):
         except Exception as e:
             await message.answer(f"❌ Ошибка базы: {e}")
 
-    @bot.on.message(text="!test_api")
-    async def test_api_handler(message: Message):
-        await message.answer("⏳ Проверяю связь с Lichess...")
-        try:
-            # Делаем прямой запрос без кэша и защит
-            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
-                resp = await client.get(f"https://lichess.org/api/team/{TEAM_ID}")
-
-                if resp.status_code == 200:
-                    await message.answer("✅ Lichess отвечает нормально (200 OK).\nЗапросы проходят!")
-                elif resp.status_code == 429:
-                    await message.answer(
-                        "🚫 Lichess БЛОКИРУЕТ запросы (429 Too Many Requests).\nВам нужно подождать 15-30 минут, чтобы IP разблокировали.")
-                else:
-                    await message.answer(f"⚠️ Lichess вернул статус: {resp.status_code}")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка соединения: {e}")
-            
     @bot.on.message(text="!clear_cache")
     async def clear_cache_handler(message: Message):
         api_cache.clear()
@@ -1431,6 +1426,24 @@ def register_handlers(bot: Bot):
             f"Удалены файлы: {', '.join(deleted_files) if deleted_files else 'файлов не было'}\n"
             f"Бот загрузит свежие данные при следующем запросе."
         )
+
+    @bot.on.message(text="!test_api")
+    async def test_api_handler(message: Message):
+        await message.answer("⏳ Проверяю связь с Lichess...")
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+                resp = await client.get(f"https://lichess.org/api/team/{TEAM_ID}",
+                                        headers={"User-Agent": "VK-ChessClubBot/1.0"})
+
+                if resp.status_code == 200:
+                    await message.answer("✅ Lichess отвечает нормально (200 OK).\nЗапросы проходят!")
+                elif resp.status_code == 429:
+                    await message.answer(
+                        "🚫 Lichess БЛОКИРУЕТ запросы (429 Too Many Requests).\nВам нужно подождать 15-30 минут, чтобы IP разблокировали.")
+                else:
+                    await message.answer(f"⚠️ Lichess вернул статус: {resp.status_code}")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка соединения: {e}")
 
     @bot.on.message(text="<text>")
     async def any_text_handler(message: Message, text: str):
