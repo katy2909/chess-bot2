@@ -51,30 +51,23 @@ VK_TOKEN = os.getenv("BOT_TOKEN")
 TEAM_ID = "pHf9ZSwg"
 
 LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
+CHAMP_KEYWORDS = ["PolyStation"]
 
-# Файл фото чемпионата (правильное название .png)
+# Файл фото чемпионата
 UNDER_PRESSURE_PHOTO = "under_pressure.png"
 
 # =====================================================================
 # 📂 НАСТРОЙКА ПОСТОЯННОГО ХРАНИЛИЩА (ДЛЯ BOTHOST)
 # =====================================================================
-# BotHost сохраняет файлы только в папке /app/data.
-# Если папки нет (локальный запуск), создается папка "data" рядом с main.py
-from pathlib import Path
-import os
-
-# Если мы на сервере BotHost, жестко используем /app/data (там данные не удаляются)
-if os.name != 'nt':
+if os.name != 'nt':  # Если запущено на сервере (Linux)
     data_dir = Path("/app/data")
-else:
-    # Если запускаем локально на Windows
+else:  # Если запущено локально на Windows
     data_dir = Path("data")
 
 data_dir.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(data_dir / "bot.db")
 
-# Этот принт поможет нам увидеть путь в логах
-print(f"=== БАЗА ДАННЫХ БУДЕТ СОЗДАНА ПО ПУТИ: {DB_PATH} ===")
+print(f"=== БАЗА ДАННЫХ ИНИЦИАЛИЗИРУЕТСЯ ПО ПУТИ: {DB_PATH} ===")
 
 # =====================================================================
 # ПЕРЕМЕННЫЕ СОСТОЯНИЯ
@@ -101,8 +94,6 @@ def format_date(ts):
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
-    print(f"=== БАЗА ДАННЫХ ИНИЦИАЛИЗИРУЕТСЯ ПО ПУТИ: {DB_PATH} ===")  # <-- ДОБАВИТЬ СЮДА
-    conn = sqlite3.connect(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
@@ -160,16 +151,6 @@ def save_user_token(vk_id, token):
 
 
 def save_token_cache(username, token):
-    print(f"DEBUG: Пытаюсь сохранить токен для {username} в базу {DB_PATH}")
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO token_cache (username, token) VALUES (?, ?)", (username.lower(), token))
-        conn.commit()
-        conn.close()
-        print("DEBUG: Токен УСПЕШНО записан в базу!")
-    except Exception as e:
-        print(f"DEBUG ОШИБКА БД: {e}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO token_cache (username, token) VALUES (?, ?)", (username.lower(), token))
@@ -472,6 +453,7 @@ def get_tournament_results_keyboard(t_format, tid, list_type, list_page, res_pag
 
     keyboard.add(Text("🔙 К списку турниров", payload={"cmd": "tournaments_list", "type": list_type, "page": list_page}),
                  color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("🔙 К статистике клуба", payload={"cmd": "menu_club"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
 
@@ -572,17 +554,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
 # РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
 # =====================================================================
 def register_handlers(bot: Bot):
-    @bot.on.message(text="!dbcheck")
-    async def dbcheck_handler(message: Message):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("SELECT username FROM token_cache")
-            tokens = c.fetchall()
-            conn.close()
-            await message.answer(f"🔍 БАЗА: {DB_PATH}\nТОКЕНЫ: {tokens}")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка базы: {e}")
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
@@ -750,14 +721,12 @@ def register_handlers(bot: Bot):
             c = conn.cursor()
             c.execute("SELECT username FROM token_cache")
             token_usernames = [row[0] for row in c.fetchall()]
-            print(f"=== ПУТЬ К БАЗЕ: {DB_PATH} ===")
-            print(f"=== НАЙДЕННЫЕ ТОКЕНЫ: {token_usernames} ===")
             c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
             known_names = {row[0].lower(): row[0] for row in c.fetchall()}
             conn.close()
 
-            leader_set = {n.lower() for n in LEADER_USERNAMES}
-            token_usernames = [known_names.get(u.lower(), u) for u in token_usernames if u.lower() not in leader_set]
+            # Теперь оставляем ВСЕХ, включая руководителей
+            token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
 
             if not token_usernames:
                 await message.answer(
@@ -875,7 +844,10 @@ def register_handlers(bot: Bot):
                 if start_rating and end_rating: text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
                 text += "\n"
             else:
-                text += f"🧩 Задачи за период: нет данных (токен не найден)\n\n"
+                if user_token:
+                    text += f"🧩 Задачи за период: нет решенных задач (токен привязан)\n\n"
+                else:
+                    text += f"🧩 Задачи за период: нет данных (токен не привязан)\n\n"
 
             if rating_lines: text += f"📈 Текущие рейтинги:\n" + "\n".join(rating_lines) + "\n"
             await message.answer(text, keyboard=get_member_period_keyboard())
@@ -1197,6 +1169,19 @@ def register_handlers(bot: Bot):
 
         await message.answer("\n".join(lines), keyboard=final_kb)
 
+    # --- КОМАНДА ДИАГНОСТИКИ ---
+    @bot.on.message(text="!dbcheck")
+    async def dbcheck_handler(message: Message):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT username FROM token_cache")
+            tokens = c.fetchall()
+            conn.close()
+            await message.answer(f"🔍 БАЗА: {DB_PATH}\nТОКЕНЫ: {tokens}")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка базы: {e}")
+
     @bot.on.message(text="<text>")
     async def any_text_handler(message: Message, text: str):
         if message.payload: return
@@ -1246,37 +1231,37 @@ def register_handlers(bot: Bot):
                 await message.answer(f"❌ Игрок {username} не найден на Lichess.\nПопробуйте другой ник:")
                 return
 
-            old_username = get_user_lichess(message.from_id)
-            old_token = get_user_token(message.from_id)
             save_user(message.from_id, username)
             waiting_for_nick.discard(message.from_id)
 
-            if old_username and old_username.lower() != username.lower():
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("DELETE FROM token_cache WHERE username=?", (old_username.lower(),))
+            # Ищем в базе, есть ли уже сохраненный токен для этого ника
+            cached_token = get_token_from_cache(username)
+
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+
+            if cached_token:
+                # Если токен найден, привязываем его к пользователю
+                c.execute("UPDATE users SET lichess_token=? WHERE vk_id=?", (cached_token, message.from_id))
+                conn.commit()
+                conn.close()
+                table_cache.clear()  # Сбрасываем кэш таблицы
+                await message.answer(
+                    f"✅ Успешно! Вы привязаны как {username}.\n"
+                    f"🔑 В базе найден сохраненный токен для этого ника.",
+                    keyboard=get_main_keyboard()
+                )
+            else:
+                # Если токена нет, отвязываем старый токен у пользователя
+                c.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
                 conn.commit()
                 conn.close()
                 table_cache.clear()
-
-            if old_token:
-                is_valid_for_new_nick = await check_token_valid(old_token, username)
-                if not is_valid_for_new_nick:
-                    conn = sqlite3.connect(DB_PATH)
-                    conn.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
-                    conn.commit()
-                    conn.close()
-                    table_cache.clear()
-                    await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}.\n",
-                        keyboard=get_main_keyboard())
-                    return
-                else:
-                    await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}. Ваш токен привязан к этому аккаунту.",
-                        keyboard=get_main_keyboard())
-                    return
-
-            await message.answer(f"✅ Успешно! Вы привязаны как {username}.", keyboard=get_main_keyboard())
+                await message.answer(
+                    f"✅ Успешно! Вы привязаны как {username}.\n"
+                    f"⚠️ Токен для этого ника не найден. Пожалуйста, привяжите его через «🔑 Мой токен Lichess».",
+                    keyboard=get_main_keyboard()
+                )
             return
 
         # --- 4. НИК УЧАСТНИКА (ДЛЯ РУКОВОДИТЕЛЕЙ) ---
