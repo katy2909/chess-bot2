@@ -1392,6 +1392,24 @@ def register_handlers(bot: Bot):
         except Exception as e:
             await message.answer(f"❌ Ошибка базы: {e}")
 
+    @bot.on.message(text="!test_api")
+    async def test_api_handler(message: Message):
+        await message.answer("⏳ Проверяю связь с Lichess...")
+        try:
+            # Делаем прямой запрос без кэша и защит
+            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+                resp = await client.get(f"https://lichess.org/api/team/{TEAM_ID}")
+
+                if resp.status_code == 200:
+                    await message.answer("✅ Lichess отвечает нормально (200 OK).\nЗапросы проходят!")
+                elif resp.status_code == 429:
+                    await message.answer(
+                        "🚫 Lichess БЛОКИРУЕТ запросы (429 Too Many Requests).\nВам нужно подождать 15-30 минут, чтобы IP разблокировали.")
+                else:
+                    await message.answer(f"⚠️ Lichess вернул статус: {resp.status_code}")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка соединения: {e}")
+            
     @bot.on.message(text="!clear_cache")
     async def clear_cache_handler(message: Message):
         api_cache.clear()
