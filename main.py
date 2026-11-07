@@ -66,9 +66,9 @@ else:
 data_dir.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(data_dir / "bot.db")
 CACHE_FILE = str(data_dir / "table_cache.json")
+CLUB_CACHE_FILE = str(data_dir / "club_cache.json")
 
 print(f"=== БАЗА ДАННЫХ ИНИЦИАЛИЗИРУЕТСЯ ПО ПУТИ: {DB_PATH} ===")
-print(f"=== ФАЙЛ КЭША ТАБЛИЦЫ: {CACHE_FILE} ===")
 
 # =====================================================================
 # ПЕРЕМЕННЫЕ СОСТОЯНИЯ И КЭШИ
@@ -87,8 +87,6 @@ daily_puzzle_cache = {"data": None, "timestamp": 0}
 tournaments_cache = {"data": [], "timestamp": 0}
 tournament_results_cache = {}
 club_stats_cache = {"text": "", "timestamp": 0}
-
-# Общий кэш для статистики игроков
 api_cache = {}
 
 
@@ -157,7 +155,7 @@ def save_user_token(vk_id, token):
     if username:
         save_token_cache(username, token)
     table_cache.clear()
-    api_cache.clear()  # Очищаем кэш статистики при добавлении токена
+    api_cache.clear()
 
 
 def save_token_cache(username, token):
@@ -177,7 +175,7 @@ def get_token_from_cache(username):
     return row[0] if row else None
 
 
-# --- LICHESS API (С ЗАЩИТОЙ ОТ 429 ОШИБКИ) ---
+# --- LICHESS API (С ЗАЩИТОЙ ОТ 429) ---
 async def fetch_lichess_json(url, token=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
@@ -185,7 +183,6 @@ async def fetch_lichess_json(url, token=None):
             try:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 429:
-                    print(f"=== ЛИМИТ LICHESS (JSON)! ЖДЕМ 5 СЕКУНД... ===")
                     await asyncio.sleep(5)
                     continue
                 resp.raise_for_status()
@@ -207,7 +204,6 @@ async def fetch_lichess_ndjson(url, token=None):
             try:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 429:
-                    print(f"=== ЛИМИТ LICHESS (NDJSON)! ЖДЕМ 5 СЕКУНД... ===")
                     await asyncio.sleep(5)
                     continue
                 resp.raise_for_status()
@@ -297,6 +293,9 @@ async def get_all_team_tournaments():
     except Exception:
         pass
 
+    if not tournaments and tournaments_cache["data"]:
+        return tournaments_cache["data"]
+
     tournaments_cache["data"] = tournaments
     tournaments_cache["timestamp"] = time.time()
     return tournaments
@@ -306,27 +305,19 @@ async def get_all_team_tournaments():
 async def upload_photo_to_vk(api, peer_id, file_path):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Файл {file_path} не найден")
-
     server = await api.photos.get_messages_upload_server(peer_id=peer_id)
     upload_url = server.upload_url
-
     with open(file_path, "rb") as f:
         file_content = f.read()
-
     form = aiohttp.FormData()
     form.add_field("photo", file_content, filename="photo.png", content_type="image/png")
-
     async with aiohttp.ClientSession() as session:
         async with session.post(upload_url, data=form) as resp:
             upload_data = await resp.json()
-
     saved = await api.photos.save_messages_photo(
-        photo=upload_data["photo"],
-        server=upload_data["server"],
-        hash=upload_data["hash"],
+        photo=upload_data["photo"], server=upload_data["server"], hash=upload_data["hash"],
     )
-    if hasattr(saved, "response"):
-        saved = saved.response
+    if hasattr(saved, "response"): saved = saved.response
     photo = saved[0] if isinstance(saved, list) else saved
     return f"photo{photo.owner_id}_{photo.id}"
 
@@ -419,7 +410,6 @@ async def fetch_member_data(client, username, start_date, end_date):
         return count
 
     results = await asyncio.gather(get_arena(), get_swiss(), get_puzzles(), return_exceptions=True)
-
     arena_c, arena_w = results[0] if isinstance(results[0], tuple) else (0, 0)
     swiss_c, swiss_w = results[1] if isinstance(results[1], tuple) else (0, 0)
     puzzles_c = results[2] if isinstance(results[2], int) else 0
@@ -468,7 +458,6 @@ async def fetch_and_save_table_data(period_type):
 
         if rows:
             rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
-
             cached_data = {}
             if os.path.exists(CACHE_FILE):
                 try:
@@ -482,11 +471,60 @@ async def fetch_and_save_table_data(period_type):
 
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cached_data, f, ensure_ascii=False)
-
-            print(f"=== ФОНОВОЕ ОБНОВЛЕНИЕ: Таблица за {period_type} обновлена ({len(rows)} чел.) ===")
+            print(f"=== ТАБЛИЦА {period_type} ОБНОВЛЕНА ({len(rows)} чел.) ===")
             return True
     except Exception as e:
-        print(f"!!! ОШИБКА ФОНОВОГО ОБНОВЛЕНИЯ ТАБЛИЦЫ: {e}")
+        print(f"!!! ОШИБКА ТАБЛИЦЫ: {e}")
+    return False
+
+
+async def fetch_and_save_club_data():
+    try:
+        team_info = await fetch_lichess_json(f"https://lichess.org/api/team/{TEAM_ID}")
+        if not team_info or 'nbMembers' not in team_info:
+            return False
+
+        tournaments = await get_all_team_tournaments()
+        top_players_text = ""
+        members = await get_club_members(TEAM_ID)
+
+        if members:
+            usernames = [m.get('id') for m in members if m.get('id')]
+            profiles = await get_users_profiles(usernames)
+            modes = [('blitz', '⚡ Блиц'), ('rapid', '🐢 Рапид'), ('bullet', '🚀 Пуля')]
+            for mode_key, mode_name in modes:
+                def get_mode_rating(p):
+                    perfs = p.get('perfs', {})
+                    r = perfs.get(mode_key, {}).get('rating', 0)
+                    return r if isinstance(r, int) else 0
+
+                mode_profiles = [p for p in profiles if get_mode_rating(p) > 0]
+                mode_profiles.sort(key=get_mode_rating, reverse=True)
+                if mode_profiles:
+                    top_players_text += f"\n👑 Топ-5 ({mode_name}):\n"
+                    for i, p in enumerate(mode_profiles[:5], 1):
+                        top_players_text += f"{i}. {p.get('username', 'Unknown')} — {get_mode_rating(p)}\n"
+
+        text = (
+            f"🏆 Статистика клуба: {team_info.get('name', 'Наш клуб')}\n\n"
+            f"👥 Участников: {team_info.get('nbMembers', 0)}\n"
+            f"📊 Всего турниров: {len(tournaments)}\n"
+            f"⏳ Идущих: {len([t for t in tournaments if t.get('status') == 20])}\n"
+            f"📅 Предстоящих: {len([t for t in tournaments if t.get('status') == 10])}\n"
+            f"🏁 Завершённых: {len([t for t in tournaments if t.get('status') == 30])}\n"
+            f"{top_players_text}\n"
+        )
+
+        club_stats_cache["text"] = text
+        club_stats_cache["timestamp"] = time.time()
+
+        with open(CLUB_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"text": text, "timestamp": time.time()}, f, ensure_ascii=False)
+
+        print("=== СТАТИСТИКА КЛУБА ОБНОВЛЕНА ===")
+        return True
+    except Exception as e:
+        print(f"!!! ОШИБКА СТАТИСТИКИ КЛУБА: {e}")
     return False
 
 
@@ -494,25 +532,25 @@ async def background_updater_loop():
     await asyncio.sleep(15)
 
     while True:
-        print("=== ЗАПУСК АВТОМАТИЧЕСКОГО ОБНОВЛЕНИЯ ===")
+        print("=== ЗАПУСК ФОНОВОГО ОБНОВЛЕНИЯ ===")
         await fetch_and_save_table_data("autumn")
         await asyncio.sleep(5)
         await fetch_and_save_table_data("spring")
+        await asyncio.sleep(5)
+        await fetch_and_save_club_data()
 
-        print("=== АВТООБНОВЛЕНИЕ ЗАВЕРШЕНО. СЛЕДУЮЩЕЕ ЧЕРЕЗ 24 ЧАСА ===")
+        print("=== ФОНОВОЕ ОБНОВЛЕНИЕ ЗАВЕРШЕНО. ЖДЕМ 24 ЧАСА ===")
         await asyncio.sleep(86400)
 
 
 # =====================================================================
-# КЛАВИАТУРЫ
+# КЛАВИАТУРЫ (остаются без изменений)
 # =====================================================================
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
-
     keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
                  color=KeyboardButtonColor.POSITIVE)
     keyboard.row()
-
     keyboard.add(Text("👤 Статистика игрока", payload={"cmd": "menu_player"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🧩 Статистика задач", payload={"cmd": "menu_puzzles"}), color=KeyboardButtonColor.PRIMARY)
@@ -524,12 +562,10 @@ def get_main_keyboard():
     keyboard.add(Text("📊 Статистика для руководителей клуба", payload={"cmd": "leaders_menu"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-
     keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.NEGATIVE)
     keyboard.row()
     keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
-
     return keyboard.get_json()
 
 
@@ -680,7 +716,6 @@ def pluralize(n, forms):
 
 async def send_table_page(target, period_type, page, is_edit=False):
     cache_entry = table_cache.get(period_type)
-
     if not cache_entry:
         cached_data = {}
         if os.path.exists(CACHE_FILE):
@@ -689,7 +724,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
                     cached_data = json.load(f)
             except Exception:
                 pass
-
         if period_type in cached_data:
             cache_entry = cached_data[period_type]
             table_cache[period_type] = cache_entry
@@ -697,7 +731,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
             cache_entry = {"data": [], "timestamp": 0}
 
     rows = cache_entry.get("data", [])
-
     per_page = 20
     start_idx = page * per_page
     end_idx = start_idx + per_page
@@ -714,24 +747,17 @@ async def send_table_page(target, period_type, page, is_edit=False):
     total_wins = sum(r[3] for r in rows)
     active_count = sum(1 for r in rows if r[1] + r[2] > 0)
 
-    text = "📊Таблица активности участников\n"
-    text += f"{period_name}\n"
-    text += f"📅 {date_range}\n\n"
-    text += f"Рейтинг участников · стр. {page + 1}/{total_pages}\n\n"
+    text = f"📊Таблица активности участников\n{period_name}\n📅 {date_range}\n\nРейтинг участников · стр. {page + 1}/{total_pages}\n\n"
 
     if page_rows:
         for i, (username, puzzles, tourns, wins) in enumerate(page_rows, start_idx + 1):
             total = puzzles + tourns
-
             ball_word = pluralize(total, ('балл', 'балла', 'баллов'))
             task_word = pluralize(puzzles, ('задача', 'задачи', 'задач'))
             tourn_word = pluralize(tourns, ('турнир', 'турнира', 'турниров'))
             win_word = pluralize(wins, ('победа', 'победы', 'побед'))
-
             prefix = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
-
-            text += f"{prefix} {username} — {total} {ball_word}\n"
-            text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word} · 🥇 {wins} {win_word}\n"
+            text += f"{prefix} {username} — {total} {ball_word}\n\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word} · 🥇 {wins} {win_word}\n"
     else:
         text += "На этой странице нет участников.\n"
 
@@ -739,13 +765,11 @@ async def send_table_page(target, period_type, page, is_edit=False):
     total_puzzles_word = pluralize(total_puzzles, ('задача', 'задачи', 'задач'))
     total_tourns_word = pluralize(total_tourns, ('турнир', 'турнира', 'турниров'))
     total_wins_word = pluralize(total_wins, ('победа', 'победы', 'побед'))
-
     text += (
         f"📈Всего: 🧩 {total_puzzles} {total_puzzles_word} · 🏆 {total_tourns} {total_tourns_word} · 🥇 {total_wins} {total_wins_word}\n"
         f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
 
     keyboard = Keyboard(one_time=False, inline=False)
-
     keyboard.add(Text("🔄 Обновить данные", payload={"cmd": "table_update", "type": period_type}),
                  color=KeyboardButtonColor.SECONDARY)
     keyboard.row()
@@ -755,7 +779,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
         nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "table_page", "type": period_type, "page": page - 1}))
     if len(rows) > end_idx:
         nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "table_page", "type": period_type, "page": page + 1}))
-
     if nav_buttons:
         for btn in nav_buttons:
             keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
@@ -769,13 +792,8 @@ async def send_table_page(target, period_type, page, is_edit=False):
         prev_id = last_table_message.get(target.peer_id)
         if prev_id is not None:
             try:
-                await target.ctx_api.messages.edit(
-                    peer_id=target.peer_id,
-                    message_id=prev_id,
-                    message=text,
-                    keyboard=kb_json,
-                    parse_mode='HTML',
-                )
+                await target.ctx_api.messages.edit(peer_id=target.peer_id, message_id=prev_id, message=text,
+                                                   keyboard=kb_json, parse_mode='HTML')
                 return
             except Exception:
                 pass
@@ -786,8 +804,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
         mid = resp.response[0].message_id
     elif isinstance(resp, list) and resp:
         mid = getattr(resp[0], 'message_id', None)
-    if mid:
-        last_table_message[target.peer_id] = mid
+    if mid: last_table_message[target.peer_id] = mid
 
 
 # =====================================================================
@@ -801,7 +818,6 @@ def register_handlers(bot: Bot):
         waiting_for_member_nick.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
-
         user = get_user_lichess(message.from_id)
         if user:
             await message.answer(f"👋 Привет! Ты привязан как {user}.\n\nВыбери нужный раздел в меню ниже:",
@@ -822,11 +838,8 @@ def register_handlers(bot: Bot):
         pending_member_target.pop(message.from_id, None)
         waiting_for_token.add(message.from_id)
         await message.answer(
-            f"🔑 Отправьте ваш персональный токен Lichess.\n\n"
-            f"Он должен принадлежать вашему аккаунту: {user}.\n"
-            f"Его можно создать здесь: https://lichess.org/account/oauth/token/create\n",
-            keyboard=Keyboard(one_time=True).get_json()
-        )
+            f"🔑 Отправьте ваш персональный токен Lichess.\n\nОн должен принадлежать вашему аккаунту: {user}.\nЕго можно создать здесь: https://lichess.org/account/oauth/token/create\n",
+            keyboard=Keyboard(one_time=True).get_json())
 
     @bot.on.message(payload_contains={"cmd": "leaders_menu"})
     async def leaders_menu_handler(message: Message):
@@ -841,15 +854,10 @@ def register_handlers(bot: Bot):
     async def champ_under_pressure_handler(message: Message):
         try:
             attachment = await upload_photo_to_vk(message.ctx_api, message.peer_id, UNDER_PRESSURE_PHOTO)
-        except FileNotFoundError:
-            await message.answer(f"⚠️ Файл {UNDER_PRESSURE_PHOTO} не найден рядом с ботом.",
+            await message.answer("🏆 Чемпионат Under Pressure", attachment=attachment,
                                  keyboard=get_back_to_main_keyboard())
-            return
         except Exception as e:
             await message.answer(f"⚠️ Не удалось загрузить фото: {e}", keyboard=get_back_to_main_keyboard())
-            return
-
-        await message.answer("🏆 Чемпионат Under Pressure", attachment=attachment, keyboard=get_back_to_main_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "view_member_stats"})
     async def view_member_stats_handler(message: Message):
@@ -884,11 +892,9 @@ def register_handlers(bot: Bot):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
         period_type = payload_data.get("type", "autumn")
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
-
         if period_type in table_cache:
             await send_table_page(message, period_type, 0)
             return
-
         cached_data = {}
         if os.path.exists(CACHE_FILE):
             try:
@@ -896,46 +902,33 @@ def register_handlers(bot: Bot):
                     cached_data = json.load(f)
             except Exception:
                 pass
-
         if period_type in cached_data:
             table_cache[period_type] = cached_data[period_type]
             await send_table_page(message, period_type, 0)
             return
-
-        await message.answer(
-            f"⏳ База только создается. Собираю таблицу за {period_name} в первый раз. Это займет около минуты...")
+        await message.answer(f"⏳ База только создается. Собираю таблицу за {period_name} в первый раз...")
         success = await fetch_and_save_table_data(period_type)
-
         if success:
             await send_table_page(message, period_type, 0)
         else:
-            await message.answer("⚠️ Не удалось собрать данные (возможно, в базе пока нет участников с токенами).",
-                                 keyboard=get_table_period_keyboard())
+            await message.answer("⚠️ Не удалось собрать данные.", keyboard=get_table_period_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "table_update"})
     async def table_update_handler(message: Message):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
         period_type = payload_data.get("type", "autumn")
-        period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
-
-        await message.answer(f"⏳ Принудительно обновляю таблицу за {period_name}. Пожалуйста, подождите...")
-
+        await message.answer(f"⏳ Принудительно обновляю таблицу. Пожалуйста, подождите...")
         if os.path.exists(CACHE_FILE):
             try:
                 with open(CACHE_FILE, "r", encoding="utf-8") as f:
                     cached_data = json.load(f)
-                if period_type in cached_data:
-                    del cached_data[period_type]
+                if period_type in cached_data: del cached_data[period_type]
                 with open(CACHE_FILE, "w", encoding="utf-8") as f:
                     json.dump(cached_data, f, ensure_ascii=False)
             except Exception:
                 pass
-
-        if period_type in table_cache:
-            del table_cache[period_type]
-
+        if period_type in table_cache: del table_cache[period_type]
         success = await fetch_and_save_table_data(period_type)
-
         if success:
             await send_table_page(message, period_type, 0)
         else:
@@ -952,30 +945,26 @@ def register_handlers(bot: Bot):
     async def member_period_handler(message: Message):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
         period_type = payload_data.get("type", "autumn")
-
         target_username = pending_member_target.get(message.from_id)
         if not target_username:
-            await message.answer("Сначала выберите участника через «👥 Статистика участника» в главном меню.")
+            await message.answer("Сначала выберите участника.")
             return
 
-        # ПРОВЕРКА КЭША (1 час)
         cache_key = f"member_period_{target_username.lower()}_{period_type}"
-        if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 3600:
+        # КЭШ 24 ЧАСА
+        if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 86400:
             await message.answer(api_cache[cache_key]["text"], keyboard=get_member_period_keyboard())
             return
 
         start_date, end_date = get_period_dates(period_type)
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
-
-        await message.answer(
-            f"⏳ Собираю статистику для {target_username} за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
+        await message.answer(f"⏳ Собираю статистику для {target_username} за {period_name}...")
 
         try:
             user_token = get_token_from_cache(target_username)
             user_data = await fetch_lichess_json(f"https://lichess.org/api/user/{target_username.lower()}")
             played_tournaments = await fetch_lichess_ndjson(
                 f"https://lichess.org/api/user/{target_username.lower()}/tournament/played")
-
             period_tourn_count = 0
             period_tourn_wins = 0
             for t in played_tournaments:
@@ -983,8 +972,7 @@ def register_handlers(bot: Bot):
                 t_date = datetime.fromtimestamp(starts_at / 1000).date()
                 if start_date <= t_date <= end_date:
                     period_tourn_count += 1
-                    if t.get('player', {}).get('rank') == 1:
-                        period_tourn_wins += 1
+                    if t.get('player', {}).get('rank') == 1: period_tourn_wins += 1
 
             puzzles_solved = 0
             puzzles_won = 0
@@ -1018,74 +1006,54 @@ def register_handlers(bot: Bot):
                     prov = " (provisional)" if perfs[mode].get('prov') else ""
                     rating_lines.append(f"• {mode.capitalize()}: {perfs[mode]['rating']}{prov}")
 
-            text = f"👤 Статистика игрока {target_username}\n"
-            text += f"📅 Период: {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
-            text += f"🏆 Турниры за период:\n• Участий: {period_tourn_count}\n• Побед (1 место): {period_tourn_wins}\n\n"
-
+            text = f"👤 Статистика игрока {target_username}\n📅 Период: {period_name}\n\n🏆 Турниры за период:\n• Участий: {period_tourn_count}\n• Побед (1 место): {period_tourn_wins}\n\n"
             if puzzles_solved > 0:
                 text += f"🧩 Задачи за период:\n• Правильно: {puzzles_won}\n• Неправильно: {puzzles_solved - puzzles_won}\n"
                 if start_rating and end_rating: text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
                 text += "\n"
             else:
-                if user_token:
-                    text += f"🧩 Задачи за период: нет решенных задач (токен привязан)\n\n"
-                else:
-                    text += f"🧩 Задачи за период: нет данных (токен не привязан)\n\n"
-
+                text += f"🧩 Задачи за период: нет данных (токен не привязан)\n\n" if not user_token else f"🧩 Задачи за период: нет решенных задач\n\n"
             if rating_lines: text += f"📈 Текущие рейтинги:\n" + "\n".join(rating_lines) + "\n"
-
-            # Сохраняем в кэш
             api_cache[cache_key] = {"text": text, "timestamp": time.time()}
-
             await message.answer(text, keyboard=get_member_period_keyboard())
         except Exception as e:
-            await message.answer(f"⚠️ Ошибка при сборе статистики: {e}", keyboard=get_member_period_keyboard())
+            await message.answer(f"⚠️ Ошибка: {e}", keyboard=get_member_period_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "menu_periods"})
     async def menu_periods_handler(message: Message):
         user = get_user_lichess(message.from_id)
         if not user:
-            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+            await message.answer("Сначала привяжите аккаунт.")
             return
-        await message.answer("📅 Выберите период, за который хотите посмотреть статистику:",
-                             keyboard=get_periods_keyboard())
+        await message.answer("📅 Выберите период:", keyboard=get_periods_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "period_stats"})
     async def period_stats_handler(message: Message):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
         period_type = payload_data.get("type", "autumn")
         user = get_user_lichess(message.from_id)
-
         if not user:
             await message.answer("Сначала привяжите аккаунт.")
             return
-
         user_token = get_token_from_cache(user)
         if not user_token:
-            await message.answer(
-                f"Для статистики за периоды нужен токен Lichess для ника {user}. Нажмите «🔑 Мой токен Lichess» в главном меню.",
-                keyboard=get_periods_keyboard())
+            await message.answer(f"Нужен токен для {user}. Нажмите «🔑 Мой токен Lichess».",
+                                 keyboard=get_periods_keyboard())
             return
 
-        # ПРОВЕРКА КЭША (1 час)
         cache_key = f"period_{user.lower()}_{period_type}"
-        if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 3600:
+        # КЭШ 24 ЧАСА
+        if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 86400:
             await message.answer(api_cache[cache_key]["text"], keyboard=get_periods_keyboard())
             return
 
         start_date, end_date = get_period_dates(period_type)
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
-
-        await message.answer(
-            f"⏳ Собираю статистику за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
+        await message.answer(f"⏳ Собираю статистику за {period_name}...")
 
         try:
             puzzles_data = await fetch_lichess_ndjson("https://lichess.org/api/puzzle/activity", token=user_token)
-            puzzles_solved = 0
-            puzzles_won = 0
-            start_rating = None
-            end_rating = None
-
+            puzzles_solved, puzzles_won, start_rating, end_rating = 0, 0, None, None
             for entry in puzzles_data:
                 try:
                     event_ts = entry.get("date", 0)
@@ -1103,9 +1071,7 @@ def register_handlers(bot: Bot):
 
             played_tournaments = await fetch_lichess_ndjson(
                 f"https://lichess.org/api/user/{user.lower()}/tournament/played")
-            tourn_count = 0
-            tourn_wins = 0
-
+            tourn_count, tourn_wins = 0, 0
             for t in played_tournaments:
                 starts_at = t.get('tournament', {}).get('startsAt', 0)
                 t_date = datetime.fromtimestamp(starts_at / 1000).date()
@@ -1114,24 +1080,19 @@ def register_handlers(bot: Bot):
                     if t.get('player', {}).get('rank') == 1: tourn_wins += 1
 
             if puzzles_solved == 0 and tourn_count == 0:
-                await message.answer(
-                    f"За {period_name.lower()} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}) у вас нет активности.",
-                    keyboard=get_periods_keyboard())
+                await message.answer(f"За {period_name.lower()} у вас нет активности.", keyboard=get_periods_keyboard())
                 return
 
-            text = f"📊 Статистика за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
+            text = f"📊 Статистика за {period_name}\n\n"
             if puzzles_solved > 0:
                 text += f"🧩 Задачи:\n• Правильно решено: {puzzles_won}\n• Неправильно решено: {puzzles_solved - puzzles_won}\n"
                 if start_rating and end_rating: text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
                 text += "\n"
             text += f"🏆 Турниры:\n• Сыграно турниров: {tourn_count}\n• Побед (1 место): {tourn_wins}\n"
-
-            # Сохраняем в кэш
             api_cache[cache_key] = {"text": text, "timestamp": time.time()}
-
             await message.answer(text, keyboard=get_periods_keyboard())
         except Exception as e:
-            await message.answer(f"⚠️ Ошибка при сборе статистики: {e}", keyboard=get_periods_keyboard())
+            await message.answer(f"⚠️ Ошибка: {e}", keyboard=get_periods_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "back_main"})
     async def back_main_handler(message: Message):
@@ -1156,10 +1117,9 @@ def register_handlers(bot: Bot):
     async def menu_player_handler(message: Message):
         lichess_user = get_user_lichess(message.from_id)
         if not lichess_user:
-            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+            await message.answer("Сначала привяжите аккаунт.")
             return
 
-        # ПРОВЕРКА КЭША (1 час)
         cache_key = f"player_{lichess_user.lower()}"
         if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 3600:
             await message.answer(api_cache[cache_key]["text"], keyboard=get_back_to_main_keyboard())
@@ -1176,31 +1136,24 @@ def register_handlers(bot: Bot):
 
         total_tournaments = len(played_tournaments)
         wins = sum(1 for item in played_tournaments if item.get('player', {}).get('rank') == 1)
-        lines = [
-            f"👤 Статистика игрока {lichess_user}\n",
-            f"🏆 Всего сыграно турниров: {total_tournaments}",
-            f"🥇 Побед (1 место): {wins}\n",
-            f"📈 Текущие рейтинги Lichess:"
-        ]
+        lines = [f"👤 Статистика игрока {lichess_user}\n", f"🏆 Всего сыграно турниров: {total_tournaments}",
+                 f"🥇 Побед (1 место): {wins}\n", f"📈 Текущие рейтинги Lichess:"]
         perfs = user_data.get('perfs', {})
         for mode in ['bullet', 'blitz', 'rapid', 'classical']:
             if mode in perfs and 'rating' in perfs[mode]:
                 prov = " (provisional)" if perfs[mode].get('prov') else ""
                 lines.append(f"• {mode.capitalize()}: {perfs[mode]['rating']}{prov}")
-
         final_text = "\n".join(lines)
         api_cache[cache_key] = {"text": final_text, "timestamp": time.time()}
-
         await message.answer(final_text, keyboard=get_back_to_main_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "menu_puzzles"})
     async def menu_puzzles_handler(message: Message):
         lichess_user = get_user_lichess(message.from_id)
         if not lichess_user:
-            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+            await message.answer("Сначала привяжите аккаунт.")
             return
 
-        # ПРОВЕРКА КЭША (1 час)
         cache_key = f"puzzles_{lichess_user.lower()}"
         if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 3600:
             await message.answer(api_cache[cache_key]["text"], keyboard=get_back_to_main_keyboard())
@@ -1223,26 +1176,24 @@ def register_handlers(bot: Bot):
                  f"🎯 Всего решено: {puzzle_perf.get('games', 0)}\n"]
         final_text = "\n".join(lines)
         api_cache[cache_key] = {"text": final_text, "timestamp": time.time()}
-
         await message.answer(final_text, keyboard=get_back_to_main_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "daily_puzzle"})
     async def daily_puzzle_handler(message: Message):
-        if daily_puzzle_cache["data"] and (time.time() - daily_puzzle_cache["timestamp"] < 3600):
+        # КЭШ 24 ЧАСА
+        if daily_puzzle_cache["data"] and (time.time() - daily_puzzle_cache["timestamp"] < 86400):
             data = daily_puzzle_cache["data"]
         else:
             await message.answer("⏳ Загружаю задачу дня...")
             try:
                 data = await fetch_lichess_json("https://lichess.org/api/puzzle/daily")
                 if not data:
-                    await message.answer("⚠️ Lichess временно ограничил запросы. Попробуйте через минуту.",
-                                         keyboard=get_back_to_main_keyboard())
+                    await message.answer("⚠️ Ограничение запросов.", keyboard=get_back_to_main_keyboard())
                     return
-
                 daily_puzzle_cache["data"] = data
                 daily_puzzle_cache["timestamp"] = time.time()
             except Exception as e:
-                await message.answer(f"⚠️ Ошибка загрузки задачи: {e}", keyboard=get_back_to_main_keyboard())
+                await message.answer(f"⚠️ Ошибка: {e}", keyboard=get_back_to_main_keyboard())
                 return
 
         try:
@@ -1255,66 +1206,32 @@ def register_handlers(bot: Bot):
 
     @bot.on.message(payload_contains={"cmd": "menu_club"})
     async def menu_club_handler(message: Message):
+        if not club_stats_cache["text"] and os.path.exists(CLUB_CACHE_FILE):
+            try:
+                with open(CLUB_CACHE_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    club_stats_cache["text"] = saved.get("text", "")
+                    club_stats_cache["timestamp"] = saved.get("timestamp", 0)
+            except Exception:
+                pass
+
         if club_stats_cache["text"] and (time.time() - club_stats_cache["timestamp"] < 86400):
             await message.answer(club_stats_cache["text"], keyboard=get_club_keyboard(True))
             return
 
-        await message.answer("⏳ Собираю статистику клуба...")
-        try:
-            team_info = await fetch_lichess_json(f"https://lichess.org/api/team/{TEAM_ID}")
-            total_members = team_info.get('nbMembers', 0)
-            team_name = team_info.get('name', 'Наш клуб')
-            tournaments = await get_all_team_tournaments()
-
-            upcoming = [t for t in tournaments if t.get('status') == 10]
-            ongoing = [t for t in tournaments if t.get('status') == 20]
-            total_tournaments = len(tournaments)
-            finished_count = total_tournaments - len(upcoming) - len(ongoing)
-
-            top_players_text = ""
-            members = await get_club_members(TEAM_ID)
-            if members:
-                usernames = [m.get('id') for m in members if m.get('id')]
-                profiles = await get_users_profiles(usernames)
-
-                modes = [('blitz', '⚡ Блиц'), ('rapid', '🐢 Рапид'), ('bullet', '🚀 Пуля')]
-                for mode_key, mode_name in modes:
-                    def get_mode_rating(p):
-                        perfs = p.get('perfs', {})
-                        r = perfs.get(mode_key, {}).get('rating', 0)
-                        return r if isinstance(r, int) else 0
-
-                    mode_profiles = [p for p in profiles if get_mode_rating(p) > 0]
-                    mode_profiles.sort(key=get_mode_rating, reverse=True)
-
-                    if mode_profiles:
-                        top_players_text += f"\n👑 Топ-5 ({mode_name}):\n"
-                        for i, p in enumerate(mode_profiles[:5], 1):
-                            top_players_text += f"{i}. {p.get('username', 'Unknown')} — {get_mode_rating(p)}\n"
-        except Exception as e:
-            await message.answer(f"⚠️ Ошибка: {e}", keyboard=get_back_to_main_keyboard())
-            return
-
-        text = (
-            f"🏆 Статистика клуба: {team_name}\n\n"
-            f"👥 Участников: {total_members}\n"
-            f"📊 Всего турниров: {total_tournaments}\n"
-            f"⏳ Идущих: {len(ongoing)}\n"
-            f"📅 Предстоящих: {len(upcoming)}\n"
-            f"🏁 Завершённых: {finished_count}\n"
-            f"{top_players_text}\n"
-        )
-
-        club_stats_cache["text"] = text
-        club_stats_cache["timestamp"] = time.time()
-
-        await message.answer(text, keyboard=get_club_keyboard(len(tournaments) > 0))
+        await message.answer("⏳ Собираю статистику клуба (это может занять время)...")
+        success = await fetch_and_save_club_data()
+        if success:
+            await message.answer(club_stats_cache["text"], keyboard=get_club_keyboard(True))
+        else:
+            await message.answer("⚠️ Не удалось получить данные клуба. Попробуйте позже.",
+                                 keyboard=get_back_to_main_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "club_update"})
     async def club_update_handler(message: Message):
         club_stats_cache["text"] = ""
         tournaments_cache["data"] = []
-        await message.answer("🔄 Кэш статистики и турниров сброшен. Открываю заново...")
+        await message.answer("🔄 Кэш сброшен. Загружаю заново...")
         await menu_club_handler(message)
 
     @bot.on.message(payload_contains={"cmd": "club_tournaments_menu"})
@@ -1338,12 +1255,10 @@ def register_handlers(bot: Bot):
         if not filtered:
             await message.answer(f"{title} не найдены.", keyboard=get_tournaments_menu_keyboard())
             return
-
         per_page = 5
         start_idx = page * per_page
         end_idx = start_idx + per_page
         page_tournaments = filtered[start_idx:end_idx]
-
         text = f"{title} (стр. {page + 1}):\nНажмите на кнопку, чтобы увидеть результаты."
         keyboard = get_paginated_tournaments_keyboard(page_tournaments, t_type, page, len(filtered) > end_idx)
         await message.answer(text, keyboard=keyboard)
@@ -1359,10 +1274,8 @@ def register_handlers(bot: Bot):
         res_page = payload_data.get("res_page", 0)
         date_str = payload_data.get("d", "?")
         players = payload_data.get("p", "?")
-
         back_kb = get_tournament_results_keyboard(t_format, tid, list_type, list_page, res_page, False, status,
                                                   date_str, players)
-
         if status == 10:
             await message.answer(
                 f"📅 Турнир ещё не начался!\n\nДата: {date_str}\nУчастников: {players}\nСсылка: https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
@@ -1378,18 +1291,9 @@ def register_handlers(bot: Bot):
             try:
                 results = await fetch_lichess_ndjson(url)
                 results.sort(key=lambda x: x.get('rank', 9999))
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    await message.answer(
-                        f"⚠️ Результаты недоступны.\nСсылка: https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
-                        keyboard=back_kb)
-                else:
-                    await message.answer(f"⚠️ Ошибка загрузки: {e}", keyboard=back_kb)
-                return
             except Exception as e:
                 await message.answer(f"⚠️ Ошибка загрузки: {e}", keyboard=back_kb)
                 return
-
             if status == 30:
                 tournament_results_cache[cache_key] = results
 
@@ -1401,26 +1305,19 @@ def register_handlers(bot: Bot):
         start_idx = res_page * per_page
         end_idx = start_idx + per_page
         page_results = results[start_idx:end_idx]
-
         if not page_results:
             await message.answer("На этой странице нет результатов.", keyboard=back_kb)
             return
 
         link = f"https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}"
-        lines = [
-            f"🏆 Результаты турнира",
-            f"📅 Дата: {date_str}",
-            f"👥 Участников: {players}",
-            f"🔗 Ссылка: {link}\n",
-            f"Таблица (места {start_idx + 1}-{min(end_idx, len(results))}):"
-        ]
+        lines = [f"🏆 Результаты турнира", f"📅 Дата: {date_str}", f"👥 Участников: {players}", f"🔗 Ссылка: {link}\n",
+                 f"Таблица (места {start_idx + 1}-{min(end_idx, len(results))}):"]
         for r in page_results:
             lines.append(f"{r.get('rank', '?')}. {r.get('username', 'Unknown')} — {r.get('score', '?')} очк.")
 
         has_next = len(results) > end_idx
         final_kb = get_tournament_results_keyboard(t_format, tid, list_type, list_page, res_page, has_next, status,
                                                    date_str, players)
-
         await message.answer("\n".join(lines), keyboard=final_kb)
 
     # --- КОМАНДЫ ДИАГНОСТИКИ ---
@@ -1449,7 +1346,6 @@ def register_handlers(bot: Bot):
     async def any_text_handler(message: Message, text: str):
         if message.payload: return
 
-        # --- 1. СЕКРЕТНЫЙ КОД ---
         if message.from_id in waiting_for_code:
             if text.strip().lower() == SECRET_CODE.lower():
                 waiting_for_code.discard(message.from_id)
@@ -1459,35 +1355,28 @@ def register_handlers(bot: Bot):
                 await message.answer("❌ Неверный код доступа. Попробуйте еще раз или напишите /start для отмены.")
             return
 
-        # --- 2. ТОКЕН ---
         if message.from_id in waiting_for_token:
             token = text.strip()
             if not token.startswith("lip_"):
-                await message.answer(
-                    "❌ Токен должен начинаться с `lip_`. Попробуйте еще раз или напишите /start для отмены.")
+                await message.answer("❌ Токен должен начинаться с `lip_`.")
                 return
-
             user = get_user_lichess(message.from_id)
             await message.answer("⏳ Проверяю токен...")
             is_valid = await check_token_valid(token, user)
             if not is_valid:
-                await message.answer(
-                    f"❌ Токен недействителен или не принадлежит аккаунту {user}. Попробуйте другой токен или напишите /start для отмены.")
+                await message.answer(f"❌ Токен недействителен или не принадлежит аккаунту {user}.")
                 return
-
             save_user_token(message.from_id, token)
             waiting_for_token.discard(message.from_id)
             await message.answer(f"✅ Токен успешно привязан! Теперь статистика задач будет доступна в полном объеме.",
                                  keyboard=get_main_keyboard())
             return
 
-        # --- 3. СМЕНА / ПРИВЯЗКА НИКА ---
         if message.from_id in waiting_for_nick:
             username = text.strip()
             if not username or len(username) > 30 or " " in username:
                 await message.answer("❌ Некорректный ник. Попробуйте еще раз (без пробелов):")
                 return
-
             await message.answer("⏳ Проверяю ник на Lichess...")
             exists = await check_user_exists(username)
             if not exists:
@@ -1496,11 +1385,9 @@ def register_handlers(bot: Bot):
 
             save_user(message.from_id, username)
             waiting_for_nick.discard(message.from_id)
-
             cached_token = get_token_from_cache(username)
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-
             if cached_token:
                 c.execute("UPDATE users SET lichess_token=? WHERE vk_id=?", (cached_token, message.from_id))
                 conn.commit()
@@ -1508,10 +1395,8 @@ def register_handlers(bot: Bot):
                 table_cache.clear()
                 api_cache.clear()
                 await message.answer(
-                    f"✅ Успешно! Вы привязаны как {username}.\n"
-                    f"🔑 В базе найден сохраненный токен для этого ника.",
-                    keyboard=get_main_keyboard()
-                )
+                    f"✅ Успешно! Вы привязаны как {username}.\n🔑 В базе найден сохраненный токен для этого ника.",
+                    keyboard=get_main_keyboard())
             else:
                 c.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
                 conn.commit()
@@ -1519,32 +1404,25 @@ def register_handlers(bot: Bot):
                 table_cache.clear()
                 api_cache.clear()
                 await message.answer(
-                    f"✅ Успешно! Вы привязаны как {username}.\n"
-                    f"⚠️ Токен для этого ника не найден. Пожалуйста, привяжите его через «🔑 Мой токен Lichess».",
-                    keyboard=get_main_keyboard()
-                )
+                    f"✅ Успешно! Вы привязаны как {username}.\n⚠️ Токен для этого ника не найден. Пожалуйста, привяжите его через «🔑 Мой токен Lichess».",
+                    keyboard=get_main_keyboard())
             return
 
-        # --- 4. НИК УЧАСТНИКА (ДЛЯ РУКОВОДИТЕЛЕЙ) ---
         if message.from_id in waiting_for_member_nick:
             target_username = text.strip()
             if not target_username or len(target_username) > 30 or " " in target_username:
                 await message.answer("❌ Некорректный ник. Попробуйте еще раз (без пробелов):")
                 return
-
             await message.answer("⏳ Проверяю ник на Lichess...")
             if not await check_user_exists(target_username):
                 await message.answer(f"❌ Игрок {target_username} не найден на Lichess.\nПопробуйте другой ник:")
                 return
-
             pending_member_target[message.from_id] = target_username
             waiting_for_member_nick.discard(message.from_id)
-
             await message.answer(f"Участник: {target_username}\nВыберите период для просмотра статистики:",
                                  keyboard=get_member_period_keyboard())
             return
 
-        # --- 5. ФОЛБЭК ---
         await message.answer("Пожалуйста, пользуйтесь кнопками в меню ниже, или напишите 'Начать'.",
                              keyboard=get_main_keyboard())
 
