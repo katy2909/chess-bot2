@@ -346,23 +346,26 @@ async def fetch_member_data(client, username, start_date, end_date):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     async def safe_get(url, req_headers=None):
-        for attempt in range(3):
+        for attempt in range(5):  # Увеличили количество попыток
             try:
                 resp = await client.get(url, headers=req_headers)
                 if resp.status_code == 429:
-                    await asyncio.sleep(2)
+                    print(f"!!! ЛИМИТ ДЛЯ {username}, ЖДЕМ 10 СЕК...")
+                    await asyncio.sleep(10)  # Ждем дольше при 429
                     continue
+                if resp.status_code == 404:
+                    return resp  # Если 404, возвращаем как есть (0 данных)
                 if resp.status_code == 200:
                     return resp
             except Exception:
                 pass
-            await asyncio.sleep(1)
-        return None
+            await asyncio.sleep(3)
+        raise Exception(f"Не удалось получить данные для {username}")
 
     async def get_arena():
         count, wins = 0, 0
         resp = await safe_get(f"https://lichess.org/api/user/{username.lower()}/tournament/played", headers)
-        if resp:
+        if resp and resp.status_code == 200:
             for line in resp.text.strip().split('\n'):
                 if line.strip():
                     try:
@@ -379,7 +382,7 @@ async def fetch_member_data(client, username, start_date, end_date):
     async def get_swiss():
         count, wins = 0, 0
         resp = await safe_get(f"https://lichess.org/api/user/{username.lower()}/swiss/played", headers)
-        if resp:
+        if resp and resp.status_code == 200:
             for line in resp.text.strip().split('\n'):
                 if line.strip():
                     try:
@@ -397,7 +400,7 @@ async def fetch_member_data(client, username, start_date, end_date):
         count = 0
         if token:
             resp = await safe_get("https://lichess.org/api/puzzle/activity", headers)
-            if resp:
+            if resp and resp.status_code == 200:
                 for line in resp.text.strip().split('\n'):
                     if line.strip():
                         try:
@@ -410,6 +413,11 @@ async def fetch_member_data(client, username, start_date, end_date):
         return count
 
     results = await asyncio.gather(get_arena(), get_swiss(), get_puzzles(), return_exceptions=True)
+
+    # Если один из запросов выкинул исключение, значит данные не получены
+    if any(isinstance(r, Exception) for r in results):
+        raise Exception(f"Ошибка при сборе для {username}")
+
     arena_c, arena_w = results[0] if isinstance(results[0], tuple) else (0, 0)
     swiss_c, swiss_w = results[1] if isinstance(results[1], tuple) else (0, 0)
     puzzles_c = results[2] if isinstance(results[2], int) else 0
@@ -431,11 +439,24 @@ async def fetch_and_save_table_data(period_type):
         token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
         if not token_usernames: return False
 
-        members = [{"id": u} for u in token_usernames]
-        rows = []
+        # Загружаем СТАРЫЕ данные, чтобы не потерять их при ошибке
+        old_rows_dict = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                    if period_type in cached_data:
+                        for r in cached_data[period_type]["data"]:
+                            old_rows_dict[r[0].lower()] = tuple(r)
+            except Exception:
+                pass
 
+        members = [{"id": u} for u in token_usernames]
+        new_results = []
+
+        # УМЕНЬШИЛИ БАТЧИ ДО 5 И УВЕЛИЧИЛИ ПАУЗУ
         async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-            sem = asyncio.Semaphore(15)
+            sem = asyncio.Semaphore(5)
 
             async def bounded_fetch(m):
                 async with sem:
@@ -443,21 +464,35 @@ async def fetch_and_save_table_data(period_type):
                     if not username: return None
                     try:
                         return await fetch_member_data(client, username, start_date, end_date)
-                    except Exception:
-                        return (username, 0, 0, 0)
+                    except Exception as e:
+                        print(str(e))
+                        return None  # Возвращаем None при ошибке
 
-            all_results = []
-            for i in range(0, len(members), 15):
-                batch = members[i:i + 15]
+            for i in range(0, len(members), 5):  # Батч по 5 человек
+                batch = members[i:i + 5]
                 batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
-                all_results.extend(batch_results)
-                await asyncio.sleep(0.5)
+                new_results.extend(batch_results)
+                await asyncio.sleep(2)  # Отдыхаем 2 секунды между батчами
 
-        for res in all_results:
-            if res: rows.append((res[0], res[1], res[2], res[3]))
+        final_rows = []
+        for m in members:
+            username = m["id"]
+            # Ищем успешный результат
+            new_res = next((r for r in new_results if r and r[0].lower() == username.lower()), None)
 
-        if rows:
-            rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
+            if new_res:
+                final_rows.append(new_res)
+            else:
+                # Если запрос упал, берем старые данные из кэша
+                if username.lower() in old_rows_dict:
+                    final_rows.append(old_rows_dict[username.lower()])
+                    print(f"=== ОШИБКА API: {username} оставлены старые данные ===")
+                else:
+                    final_rows.append((username, 0, 0, 0))
+
+        if final_rows:
+            final_rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
+
             cached_data = {}
             if os.path.exists(CACHE_FILE):
                 try:
@@ -466,15 +501,15 @@ async def fetch_and_save_table_data(period_type):
                 except Exception:
                     pass
 
-            cached_data[period_type] = {"data": rows, "timestamp": time.time()}
+            cached_data[period_type] = {"data": final_rows, "timestamp": time.time()}
             table_cache[period_type] = cached_data[period_type]
 
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cached_data, f, ensure_ascii=False)
-            print(f"=== ТАБЛИЦА {period_type} ОБНОВЛЕНА ({len(rows)} чел.) ===")
+            print(f"=== ТАБЛИЦА {period_type} УСПЕШНО ОБНОВЛЕНА ===")
             return True
     except Exception as e:
-        print(f"!!! ОШИБКА ТАБЛИЦЫ: {e}")
+        print(f"!!! ГЛОБАЛЬНАЯ ОШИБКА ТАБЛИЦЫ: {e}")
     return False
 
 
@@ -951,7 +986,6 @@ def register_handlers(bot: Bot):
             return
 
         cache_key = f"member_period_{target_username.lower()}_{period_type}"
-        # КЭШ 24 ЧАСА
         if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 86400:
             await message.answer(api_cache[cache_key]["text"], keyboard=get_member_period_keyboard())
             return
@@ -1042,7 +1076,6 @@ def register_handlers(bot: Bot):
             return
 
         cache_key = f"period_{user.lower()}_{period_type}"
-        # КЭШ 24 ЧАСА
         if cache_key in api_cache and time.time() - api_cache[cache_key]["timestamp"] < 86400:
             await message.answer(api_cache[cache_key]["text"], keyboard=get_periods_keyboard())
             return
@@ -1180,7 +1213,6 @@ def register_handlers(bot: Bot):
 
     @bot.on.message(payload_contains={"cmd": "daily_puzzle"})
     async def daily_puzzle_handler(message: Message):
-        # КЭШ 24 ЧАСА
         if daily_puzzle_cache["data"] and (time.time() - daily_puzzle_cache["timestamp"] < 86400):
             data = daily_puzzle_cache["data"]
         else:
@@ -1339,8 +1371,21 @@ def register_handlers(bot: Bot):
         club_stats_cache["text"] = ""
         tournaments_cache["data"] = []
         table_cache.clear()
+
+        deleted_files = []
+        for file_path in [CACHE_FILE, CLUB_CACHE_FILE]:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    deleted_files.append(os.path.basename(file_path))
+                except Exception:
+                    pass
+
         await message.answer(
-            "🗑 Все кэши (таблицы, статистики, турниров) успешно очищены! При следующем запросе бот загрузит свежие данные.")
+            f"🗑 Кэш успешно очищен!\n"
+            f"Удалены файлы: {', '.join(deleted_files) if deleted_files else 'файлов не было'}\n"
+            f"Бот загрузит свежие данные при следующем запросе."
+        )
 
     @bot.on.message(text="<text>")
     async def any_text_handler(message: Message, text: str):
