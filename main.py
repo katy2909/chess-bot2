@@ -572,6 +572,17 @@ async def send_table_page(target, period_type, page, is_edit=False):
 # РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
 # =====================================================================
 def register_handlers(bot: Bot):
+    @bot.on.message(text="!dbcheck")
+    async def dbcheck_handler(message: Message):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT username FROM token_cache")
+            tokens = c.fetchall()
+            conn.close()
+            await message.answer(f"🔍 БАЗА: {DB_PATH}\nТОКЕНЫ: {tokens}")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка базы: {e}")
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
