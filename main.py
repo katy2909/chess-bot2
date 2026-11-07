@@ -665,7 +665,25 @@ def pluralize(n, forms):
 
 
 async def send_table_page(target, period_type, page, is_edit=False):
-    cache_entry = table_cache.get(period_type, {})
+    # 1. Пытаемся взять данные из оперативной памяти
+    cache_entry = table_cache.get(period_type)
+
+    # 2. Если в памяти пусто (сервер перезапустился), читаем из файла
+    if not cache_entry:
+        cached_data = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+            except Exception:
+                pass
+
+        if period_type in cached_data:
+            cache_entry = cached_data[period_type]
+            table_cache[period_type] = cache_entry  # Восстанавливаем в памяти
+        else:
+            cache_entry = {"data": [], "timestamp": 0}
+
     rows = cache_entry.get("data", [])
 
     per_page = 20
@@ -725,6 +743,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
         nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "table_page", "type": period_type, "page": page - 1}))
     if len(rows) > end_idx:
         nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "table_page", "type": period_type, "page": page + 1}))
+
     if nav_buttons:
         for btn in nav_buttons:
             keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
