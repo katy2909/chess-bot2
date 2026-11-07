@@ -6,7 +6,7 @@ import re
 import time
 import aiohttp
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from aiohttp import TCPConnector
 
@@ -346,15 +346,15 @@ async def fetch_member_data(client, username, start_date, end_date):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     async def safe_get(url, req_headers=None):
-        for attempt in range(5):  # Увеличили количество попыток
+        for attempt in range(5):
             try:
                 resp = await client.get(url, headers=req_headers)
                 if resp.status_code == 429:
                     print(f"!!! ЛИМИТ ДЛЯ {username}, ЖДЕМ 10 СЕК...")
-                    await asyncio.sleep(10)  # Ждем дольше при 429
+                    await asyncio.sleep(10)
                     continue
                 if resp.status_code == 404:
-                    return resp  # Если 404, возвращаем как есть (0 данных)
+                    return resp
                 if resp.status_code == 200:
                     return resp
             except Exception:
@@ -414,7 +414,6 @@ async def fetch_member_data(client, username, start_date, end_date):
 
     results = await asyncio.gather(get_arena(), get_swiss(), get_puzzles(), return_exceptions=True)
 
-    # Если один из запросов выкинул исключение, значит данные не получены
     if any(isinstance(r, Exception) for r in results):
         raise Exception(f"Ошибка при сборе для {username}")
 
@@ -439,7 +438,6 @@ async def fetch_and_save_table_data(period_type):
         token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
         if not token_usernames: return False
 
-        # Загружаем СТАРЫЕ данные, чтобы не потерять их при ошибке
         old_rows_dict = {}
         if os.path.exists(CACHE_FILE):
             try:
@@ -454,7 +452,6 @@ async def fetch_and_save_table_data(period_type):
         members = [{"id": u} for u in token_usernames]
         new_results = []
 
-        # УМЕНЬШИЛИ БАТЧИ ДО 5 И УВЕЛИЧИЛИ ПАУЗУ
         async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
             sem = asyncio.Semaphore(5)
 
@@ -466,24 +463,22 @@ async def fetch_and_save_table_data(period_type):
                         return await fetch_member_data(client, username, start_date, end_date)
                     except Exception as e:
                         print(str(e))
-                        return None  # Возвращаем None при ошибке
+                        return None
 
-            for i in range(0, len(members), 5):  # Батч по 5 человек
+            for i in range(0, len(members), 5):
                 batch = members[i:i + 5]
                 batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
                 new_results.extend(batch_results)
-                await asyncio.sleep(2)  # Отдыхаем 2 секунды между батчами
+                await asyncio.sleep(2)
 
         final_rows = []
         for m in members:
             username = m["id"]
-            # Ищем успешный результат
             new_res = next((r for r in new_results if r and r[0].lower() == username.lower()), None)
 
             if new_res:
                 final_rows.append(new_res)
             else:
-                # Если запрос упал, берем старые данные из кэша
                 if username.lower() in old_rows_dict:
                     final_rows.append(old_rows_dict[username.lower()])
                     print(f"=== ОШИБКА API: {username} оставлены старые данные ===")
@@ -564,22 +559,55 @@ async def fetch_and_save_club_data():
 
 
 async def background_updater_loop():
+    # Ждем 15 секунд при запуске, чтобы бот прогрузился
     await asyncio.sleep(15)
 
     while True:
-        print("=== ЗАПУСК ФОНОВОГО ОБНОВЛЕНИЯ ===")
+        # Определяем московское время (UTC+3)
+        msk_tz = timezone(timedelta(hours=3))
+        now_msk = datetime.now(msk_tz)
+
+        # Вычисляем, сколько секунд осталось до ближайших 00:00 по МСК
+        next_midnight = (now_msk + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_midnight = (next_midnight - now_msk).total_seconds()
+
+        print(f"=== СЛЕДУЮЩЕЕ ОБНОВЛЕНИЕ ЗАПЛАНИРОВАНО НА {next_midnight.strftime('%d.%m.%Y %H:%M')} МСК ===")
+
+        # Спим до полуночи
+        await asyncio.sleep(seconds_until_midnight)
+
+        # --- НАСТУПИЛО 00:00 МСК ---
+        print("=== 00:00 МСК: СБРОС КЭШЕЙ И ЗАПУСК ОБНОВЛЕНИЯ ===")
+
+        # 1. Сбрасываем кэши задачи дня, периодов и турниров
+        daily_puzzle_cache["data"] = None
+        daily_puzzle_cache["timestamp"] = 0
+        api_cache.clear()
+        tournaments_cache["data"] = []
+
+        # 2. Удаляем старые файлы кэша таблицы и клуба, чтобы они собрались заново
+        for file_path in [CACHE_FILE, CLUB_CACHE_FILE]:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+
+        table_cache.clear()
+        club_stats_cache["text"] = ""
+
+        # 3. Запускаем сбор тяжелых данных
         await fetch_and_save_table_data("autumn")
         await asyncio.sleep(5)
         await fetch_and_save_table_data("spring")
         await asyncio.sleep(5)
         await fetch_and_save_club_data()
 
-        print("=== ФОНОВОЕ ОБНОВЛЕНИЕ ЗАВЕРШЕНО. ЖДЕМ 24 ЧАСА ===")
-        await asyncio.sleep(86400)
+        print("=== НОЧНОЕ ОБНОВЛЕНИЕ ЗАВЕРШЕНО ===")
 
 
 # =====================================================================
-# КЛАВИАТУРЫ (остаются без изменений)
+# КЛАВИАТУРЫ (без изменений)
 # =====================================================================
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
