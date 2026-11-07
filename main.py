@@ -653,41 +653,47 @@ def register_handlers(bot: Bot):
         tourn_wins = 0
         puzzles_solved = 0
 
-        # 1. Арены
+        # 1. Арены (убрали ?max=1000)
         try:
-            url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played?max=1000"
+            url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played"
             resp = await client.get(url_arena)
             if resp.status_code == 200:
                 for line in resp.text.strip().split('\n'):
                     if line.strip():
-                        t = json.loads(line)
-                        starts_at = t.get('tournament', {}).get('startsAt', 0)
-                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date:
-                            tourn_count += 1
-                            if t.get('player', {}).get('rank') == 1:
-                                tourn_wins += 1
+                        try:
+                            t = json.loads(line)
+                            starts_at = t.get('tournament', {}).get('startsAt', 0)
+                            t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                            if start_date <= t_date <= end_date:
+                                tourn_count += 1
+                                if t.get('player', {}).get('rank') == 1:
+                                    tourn_wins += 1
+                        except Exception:
+                            continue
         except Exception:
             pass
 
-        # 2. Швейцарки
+        # 2. Швейцарки (убрали ?max=1000)
         try:
-            url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played?max=1000"
+            url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played"
             resp = await client.get(url_swiss)
             if resp.status_code == 200:
                 for line in resp.text.strip().split('\n'):
                     if line.strip():
-                        t = json.loads(line)
-                        starts_at = t.get('tournament', {}).get('startsAt', 0)
-                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date:
-                            tourn_count += 1
-                            if t.get('player', {}).get('rank') == 1:
-                                tourn_wins += 1
+                        try:
+                            t = json.loads(line)
+                            starts_at = t.get('tournament', {}).get('startsAt', 0)
+                            t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                            if start_date <= t_date <= end_date:
+                                tourn_count += 1
+                                if t.get('player', {}).get('rank') == 1:
+                                    tourn_wins += 1
+                        except Exception:
+                            continue
         except Exception:
             pass
 
-        # 3. Задачи
+        # 3. Задачи (убрали ?max=1000, улучшили обработку ошибок)
         token = get_token_from_cache(username)
         if token:
             try:
@@ -697,26 +703,14 @@ def register_handlers(bot: Bot):
                 if resp.status_code == 200:
                     for line in resp.text.strip().split('\n'):
                         if line.strip():
-                            entry = json.loads(line)
-                            event_ts = entry.get("date", 0)
-                            event_date = datetime.fromtimestamp(event_ts / 1000).date()
-                            if start_date <= event_date <= end_date:
-                                puzzles_solved += 1
-            except Exception:
-                pass
-        else:
-            try:
-                url_act = f"https://lichess.org/api/user/{username.lower()}/activity"
-                resp = await client.get(url_act)
-                if resp.status_code == 200:
-                    activities = resp.json()
-                    for act in activities:
-                        interval_start = datetime.fromtimestamp(act['interval']['start'] / 1000).date()
-                        interval_end = datetime.fromtimestamp(act['interval']['end'] / 1000).date()
-                        if interval_start <= end_date and interval_end >= start_date:
-                            puzzles_data = act.get('puzzles', {}).get('score', {})
-                            if puzzles_data:
-                                puzzles_solved += puzzles_data.get('win', 0) + puzzles_data.get('loss', 0)
+                            try:
+                                entry = json.loads(line)
+                                event_ts = entry.get("date", 0)
+                                event_date = datetime.fromtimestamp(event_ts / 1000).date()
+                                if start_date <= event_date <= end_date:
+                                    puzzles_solved += 1
+                            except Exception:
+                                continue
             except Exception:
                 pass
 
@@ -759,7 +753,7 @@ def register_handlers(bot: Bot):
             rows = []
 
             async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
-                sem = asyncio.Semaphore(25)
+                sem = asyncio.Semaphore(5)
 
                 async def bounded_fetch(m):
                     async with sem:
