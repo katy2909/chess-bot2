@@ -483,6 +483,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
     total_pages = max(1, (len(rows) + per_page - 1) // per_page)
     total_puzzles = sum(r[1] for r in rows)
     total_tourns = sum(r[2] for r in rows)
+    total_wins = sum(r[3] for r in rows)
     active_count = sum(1 for r in rows if r[1] + r[2] > 0)
 
     text = "📊Таблица активности участников\n"
@@ -491,24 +492,32 @@ async def send_table_page(target, period_type, page, is_edit=False):
     text += f"Рейтинг участников · стр. {page + 1}/{total_pages}\n\n"
 
     if page_rows:
-        for i, (username, puzzles, tourns) in enumerate(page_rows, start_idx + 1):
+        # Теперь распаковываем 4 значения: username, puzzles, tourns, wins
+        for i, (username, puzzles, tourns, wins) in enumerate(page_rows, start_idx + 1):
             total = puzzles + tourns
+
             ball_word = pluralize(total, ('балл', 'балла', 'баллов'))
             task_word = pluralize(puzzles, ('задача', 'задачи', 'задач'))
             tourn_word = pluralize(tourns, ('турнир', 'турнира', 'турниров'))
+            win_word = pluralize(wins, ('победа', 'победы', 'побед'))
 
             prefix = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
+
+            # Выводим основную строку с баллами
             text += f"{prefix} {username} — {total} {ball_word}\n"
-            text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word}\n"
+            # Выводим детальную статистику (задачи, турниры, победы)
+            text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word} · 🥇 {wins} {win_word}\n"
     else:
         text += "На этой странице нет участников.\n"
 
     text += "\n" + "━" * 22 + "\n\n"
     total_puzzles_word = pluralize(total_puzzles, ('задача', 'задачи', 'задач'))
     total_tourns_word = pluralize(total_tourns, ('турнир', 'турнира', 'турниров'))
+    total_wins_word = pluralize(total_wins, ('победа', 'победы', 'побед'))
 
-    text += (f"📈Всего: 🧩 {total_puzzles} {total_puzzles_word} · 🏆 {total_tourns} {total_tourns_word}\n"
-             f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
+    text += (
+        f"📈Всего: 🧩 {total_puzzles} {total_puzzles_word} · 🏆 {total_tourns} {total_tourns_word} · 🥇 {total_wins} {total_wins_word}\n"
+        f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
 
     keyboard = Keyboard(one_time=False, inline=False)
     nav_buttons = []
@@ -641,8 +650,10 @@ def register_handlers(bot: Bot):
 
     async def fetch_member_data(client, username, start_date, end_date):
         tourn_count = 0
+        tourn_wins = 0
         puzzles_solved = 0
 
+        # 1. Арены
         try:
             url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played?max=1000"
             resp = await client.get(url_arena)
@@ -652,10 +663,14 @@ def register_handlers(bot: Bot):
                         t = json.loads(line)
                         starts_at = t.get('tournament', {}).get('startsAt', 0)
                         t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date: tourn_count += 1
+                        if start_date <= t_date <= end_date:
+                            tourn_count += 1
+                            if t.get('player', {}).get('rank') == 1:
+                                tourn_wins += 1
         except Exception:
             pass
 
+        # 2. Швейцарки
         try:
             url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played?max=1000"
             resp = await client.get(url_swiss)
@@ -665,10 +680,14 @@ def register_handlers(bot: Bot):
                         t = json.loads(line)
                         starts_at = t.get('tournament', {}).get('startsAt', 0)
                         t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date: tourn_count += 1
+                        if start_date <= t_date <= end_date:
+                            tourn_count += 1
+                            if t.get('player', {}).get('rank') == 1:
+                                tourn_wins += 1
         except Exception:
             pass
 
+        # 3. Задачи
         token = get_token_from_cache(username)
         if token:
             try:
@@ -681,7 +700,8 @@ def register_handlers(bot: Bot):
                             entry = json.loads(line)
                             event_ts = entry.get("date", 0)
                             event_date = datetime.fromtimestamp(event_ts / 1000).date()
-                            if start_date <= event_date <= end_date: puzzles_solved += 1
+                            if start_date <= event_date <= end_date:
+                                puzzles_solved += 1
             except Exception:
                 pass
         else:
@@ -695,11 +715,12 @@ def register_handlers(bot: Bot):
                         interval_end = datetime.fromtimestamp(act['interval']['end'] / 1000).date()
                         if interval_start <= end_date and interval_end >= start_date:
                             puzzles_data = act.get('puzzles', {}).get('score', {})
-                            if puzzles_data: puzzles_solved += puzzles_data.get('win', 0) + puzzles_data.get('loss', 0)
+                            if puzzles_data:
+                                puzzles_solved += puzzles_data.get('win', 0) + puzzles_data.get('loss', 0)
             except Exception:
                 pass
 
-        return (username, puzzles_solved, tourn_count)
+        return (username, puzzles_solved, tourn_count, tourn_wins)
 
     @bot.on.message(payload_contains={"cmd": "table_period"})
     async def table_period_handler(message: Message):
@@ -725,7 +746,7 @@ def register_handlers(bot: Bot):
             known_names = {row[0].lower(): row[0] for row in c.fetchall()}
             conn.close()
 
-            # Теперь оставляем ВСЕХ, включая руководителей
+            # Оставляем ВСЕХ (включая руководителей)
             token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
 
             if not token_usernames:
@@ -747,18 +768,19 @@ def register_handlers(bot: Bot):
                         try:
                             return await fetch_member_data(client, username, start_date, end_date)
                         except Exception:
-                            return (username, 0, 0)
+                            return (username, 0, 0, 0)
 
                 results = await asyncio.gather(*(bounded_fetch(m) for m in members))
 
             for res in results:
-                if res: rows.append((res[0], res[1], res[2]))
+                if res: rows.append((res[0], res[1], res[2], res[3]))
 
             if not rows:
                 await message.answer("Не удалось собрать данные ни по одному участнику.")
                 return
 
-            rows.sort(key=lambda x: (-(x[1] + x[2]), x[0].lower()))
+            # Сортируем: сначала по сумме (задачи+турниры), потом по победам, потом по алфавиту
+            rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
             table_cache[period_type] = rows
             await send_table_page(message, period_type, 0)
 
@@ -801,7 +823,8 @@ def register_handlers(bot: Bot):
                 t_date = datetime.fromtimestamp(starts_at / 1000).date()
                 if start_date <= t_date <= end_date:
                     period_tourn_count += 1
-                    if t.get('player', {}).get('rank') == 1: period_tourn_wins += 1
+                    if t.get('player', {}).get('rank') == 1:
+                        period_tourn_wins += 1
 
             puzzles_solved = 0
             puzzles_won = 0
