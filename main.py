@@ -4,8 +4,10 @@ import httpx
 import asyncio
 import re
 import time
-import aiohttp  # NEW — для загрузки фото
+import aiohttp
+import os
 from datetime import datetime, date
+from pathlib import Path
 from aiohttp import TCPConnector
 
 # --- ИСПРАВЛЕНИЕ БАГА VKBOTTLE ---
@@ -34,9 +36,6 @@ async def _safe_payload_check(self, event):
 
 PayloadRule.check = _safe_payload_check
 
-
-import os
-
 os.environ["VKBOTTLE_SKIP_LOGGING_PRESET"] = "1"
 
 from vkbottle.bot import Bot, Message
@@ -45,40 +44,39 @@ from vkbottle.http import SingleAiohttpClient
 from vkbottle.api import API
 
 # =====================================================================
-# ⚠️ ЗАПОЛНИТЕ ПЕРЕМЕННЫЕ ⚠️
+# ⚠️ НАСТРОЙКИ ⚠️
 # =====================================================================
 SECRET_CODE = "chess-bot"
-# =====================================================================
-
 VK_TOKEN = os.getenv("BOT_TOKEN")
 TEAM_ID = "pHf9ZSwg"
-waiting_for_code = set()
-waiting_for_nick = set()
-waiting_for_table = set()
-pending_member_target = {}
-champ_overall_cache = {"data": [], "timestamp": 0}
-table_cache = {}
-last_table_message = {}
 
-# 👇 Впишите ники руководителей и админов клуба (регистр не важен)
 LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
 
-# 🏆 НАСТРОЙКИ МИНИ-ЧЕМПИОНАТА
-CHAMP_KEYWORDS = ["PolyStation"]
+# Файл фото чемпионата (правильное название .png)
+UNDER_PRESSURE_PHOTO = "under_pressure.png"
 
-DB_PATH = "bot.db"
-tournament_cache = {}
+# =====================================================================
+# 📂 НАСТРОЙКА ПОСТОЯННОГО ХРАНИЛИЩА (ДЛЯ BOTHOST)
+# =====================================================================
+# BotHost сохраняет файлы только в папке /app/data.
+# Если папки нет (локальный запуск), создается папка "data" рядом с main.py
+data_dir = Path(os.environ.get("DATA_DIR", "data"))
+data_dir.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = data_dir / "bot.db"
+
+# =====================================================================
+# ПЕРЕМЕННЫЕ СОСТОЯНИЯ
+# =====================================================================
+waiting_for_code = set()
 waiting_for_nick = set()
 waiting_for_token = set()
 waiting_for_member_nick = set()
 waiting_for_table = set()
 pending_member_target = {}
-champ_overall_cache = {"data": [], "timestamp": 0}
+
 table_cache = {}
 last_table_message = {}
-
-# NEW — путь к фото чемпионата (положите файл рядом с ботом)
-UNDER_PRESSURE_PHOTO = "under_pressure.png"
 
 
 # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
@@ -145,7 +143,6 @@ def save_user_token(vk_id, token):
     username = get_user_lichess(vk_id)
     if username:
         save_token_cache(username, token)
-    # FIX: новый токен => таблица должна пересобраться
     table_cache.clear()
 
 
@@ -257,9 +254,8 @@ async def get_all_team_tournaments():
     return tournaments
 
 
-# --- NEW: ЗАГРУЗКА ФОТО В VK ---
+# --- ЗАГРУЗКА ФОТО В VK ---
 async def upload_photo_to_vk(api, peer_id, file_path):
-    """Загружает локальное фото в VK и возвращает attachment-строку."""
     server = await api.photos.get_messages_upload_server(peer_id=peer_id)
     upload_url = server.upload_url
 
@@ -267,7 +263,7 @@ async def upload_photo_to_vk(api, peer_id, file_path):
         file_content = f.read()
 
     form = aiohttp.FormData()
-    form.add_field("photo", file_content, filename="photo.jpg", content_type="image/jpeg")
+    form.add_field("photo", file_content, filename="photo.png", content_type="image/png")
 
     async with aiohttp.ClientSession() as session:
         async with session.post(upload_url, data=form) as resp:
@@ -278,64 +274,10 @@ async def upload_photo_to_vk(api, peer_id, file_path):
         server=upload_data["server"],
         hash=upload_data["hash"],
     )
-    # vkbottle может вернуть обёртку
     if hasattr(saved, "response"):
         saved = saved.response
     photo = saved[0] if isinstance(saved, list) else saved
     return f"photo{photo.owner_id}_{photo.id}"
-
-
-# --- ЛОГИКА МИНИ-ЧЕМПИОНАТА ---
-def is_champ_stage(tournament):
-    name = tournament.get('fullName', tournament.get('name', '')).lower()
-    return any(keyword.lower() in name for keyword in CHAMP_KEYWORDS)
-
-
-def get_stage_number(tournament):
-    name = tournament.get('fullName', tournament.get('name', ''))
-    match = re.search(r'(\d+\.\d+)', name)
-    if match:
-        return match.group(1)
-    match = re.search(r'(\d+)(?:st|nd|rd|th)', name, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return None
-
-
-def get_sorted_champ_stages(all_tournaments):
-    finished = [t for t in all_tournaments if t.get('status') == 30 and is_champ_stage(t)]
-    finished.sort(key=lambda x: x.get('startsAt', 0))
-    return finished
-
-
-def get_points(rank):
-    if rank == 1:
-        return 25
-    elif rank == 2:
-        return 18
-    elif rank == 3:
-        return 15
-    elif rank == 4:
-        return 12
-    elif rank == 5:
-        return 11
-    elif rank == 6:
-        return 10
-    elif rank == 7:
-        return 9
-    elif rank == 8:
-        return 8
-    elif rank == 9:
-        return 7
-    elif rank == 10:
-        return 6
-    elif 11 <= rank <= 15:
-        return 3
-    elif 16 <= rank <= 20:
-        return 2
-    elif rank >= 21:
-        return 1
-    return 0
 
 
 # --- РАСЧЕТ ПЕРИОДОВ ---
@@ -350,15 +292,14 @@ def get_period_dates(period_type):
     return start, end
 
 
-# --- ПРОВЕРКА ПРАВ РУКОВОДИТЕЛЯ ---
 async def is_club_leader(username):
     return username.lower() in [name.lower() for name in LEADER_USERNAMES]
 
 
-# --- КЛАВИАТУРЫ ---
+# =====================================================================
+# КЛАВИАТУРЫ
+# =====================================================================
 def get_main_keyboard():
-    # MODIFIED: убраны "Статистика участника" и "Таблица участников",
-    # добавлены "Статистика для руководителей клуба" и "Чемпионат Under Pressure"
     keyboard = Keyboard(one_time=False, inline=False)
     keyboard.add(Text("👤 Статистика игрока", payload={"cmd": "menu_player"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
@@ -382,13 +323,11 @@ def get_main_keyboard():
 
 
 def get_leaders_menu_keyboard():
-    # NEW: подменю "Статистика для руководителей клуба"
     keyboard = Keyboard(one_time=False, inline=False)
     keyboard.add(Text("👥 Статистика участника", payload={"cmd": "view_member_stats"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("📊 Таблица участников", payload={"cmd": "table_members"}),
-                 color=KeyboardButtonColor.PRIMARY)
+    keyboard.add(Text("📊 Таблица участников", payload={"cmd": "table_members"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
@@ -396,10 +335,10 @@ def get_leaders_menu_keyboard():
 
 def get_periods_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
-    keyboard.add(Text("🍂 Осенний период (1 сен - 15 дек)", payload={"cmd": "period_stats", "type": "autumn"}),
+    keyboard.add(Text("🍂 Осенний период", payload={"cmd": "period_stats", "type": "autumn"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("🌸 Весенний период (1 фев - 15 мая)", payload={"cmd": "period_stats", "type": "spring"}),
+    keyboard.add(Text("🌸 Весенний период", payload={"cmd": "period_stats", "type": "spring"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
@@ -426,87 +365,6 @@ def get_member_period_keyboard():
     keyboard.add(Text("🌸 Весенний период", payload={"cmd": "member_period", "type": "spring"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_champ_menu_keyboard():
-    keyboard = Keyboard(one_time=False, inline=False)
-    keyboard.add(Text("📊 Общая таблица", payload={"cmd": "champ_overall", "page": 0}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("📅 Список этапов", payload={"cmd": "champ_stages", "page": 0}), color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_overall_keyboard(page, has_next):
-    keyboard = Keyboard(one_time=False, inline=False)
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "champ_overall", "page": page - 1}))
-    if has_next:
-        nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "champ_overall", "page": page + 1}))
-
-    if nav_buttons:
-        for btn in nav_buttons:
-            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
-        keyboard.row()
-
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_stages_keyboard(stages, page):
-    keyboard = Keyboard(one_time=False, inline=False)
-    per_page = 5
-    start_idx = page * per_page
-    end_idx = start_idx + per_page
-
-    for i, s in enumerate(stages[start_idx:end_idx]):
-        global_idx = start_idx + i + 1
-        stage_num = get_stage_number(s)
-        prefix = f"Этап {stage_num}: " if stage_num else f"{global_idx}. "
-        short_name = s['name'][:20] + "..." if len(s['name']) > 20 else s['name']
-
-        keyboard.add(Text(f"{prefix}{short_name}",
-                          payload={"cmd": "champ_view_stage", "idx": start_idx + i, "page": page, "res_page": 0}),
-                     color=KeyboardButtonColor.SECONDARY)
-        keyboard.row()
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "champ_stages", "page": page - 1}))
-    if end_idx < len(stages):
-        nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "champ_stages", "page": page + 1}))
-
-    if nav_buttons:
-        for btn in nav_buttons:
-            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
-        keyboard.row()
-
-    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-    return keyboard.get_json()
-
-
-def get_stage_results_keyboard(idx, page, res_page, has_next):
-    keyboard = Keyboard(one_time=False, inline=False)
-    nav_buttons = []
-    if res_page > 0:
-        nav_buttons.append(
-            Text("⬅️ Назад", payload={"cmd": "champ_view_stage", "idx": idx, "page": page, "res_page": res_page - 1}))
-    if has_next:
-        nav_buttons.append(
-            Text("Вперед ➡️", payload={"cmd": "champ_view_stage", "idx": idx, "page": page, "res_page": res_page + 1}))
-
-    if nav_buttons:
-        for btn in nav_buttons:
-            keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
-        keyboard.row()
-
-    keyboard.add(Text("🔙 К списку этапов", payload={"cmd": "champ_stages", "page": page}),
-                 color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
 
@@ -547,11 +405,8 @@ def get_paginated_tournaments_keyboard(page_tournaments, t_type, page, has_next)
         t_format = "tournament" if "clock" in t else "swiss"
         players = t.get('nbPlayers', 0)
         date_str = format_date(t.get('startsAt'))
-
         short_date = date_str[:5] if date_str != "Неизвестно" else ""
-
         btn_text = f"🏆 {short_name} ({players}ч., {short_date})"
-
         keyboard.add(Text(btn_text, payload={
             "cmd": "view", "format": t_format, "id": t['id'], "status": t.get('status'),
             "list_type": t_type, "list_page": page, "res_page": 0, "d": date_str, "p": players
@@ -594,35 +449,20 @@ def get_tournament_results_keyboard(t_format, tid, list_type, list_page, res_pag
 
     keyboard.add(Text("🔙 К списку турниров", payload={"cmd": "tournaments_list", "type": list_type, "page": list_page}),
                  color=KeyboardButtonColor.SECONDARY)
-    keyboard.add(Text("🔙 К статистике клуба", payload={"cmd": "menu_club"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
 
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ ---
-def get_ball_word(n):
-    if n % 10 == 1 and n % 100 != 11:
-        return "балл"
-    elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
-        return "балла"
-    else:
-        return "баллов"
-
-
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ТАБЛИЦЫ ---
 def pluralize(n, forms):
-    """Склонение русских слов: forms = ('задача', 'задачи', 'задач')"""
     n = abs(n) % 100
     n1 = n % 10
-    if 10 < n < 20:
-        return forms[2]
-    if 1 < n1 < 5:
-        return forms[1]
-    if n1 == 1:
-        return forms[0]
+    if 10 < n < 20: return forms[2]
+    if 1 < n1 < 5: return forms[1]
+    if n1 == 1: return forms[0]
     return forms[2]
 
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ ---
 async def send_table_page(target, period_type, page, is_edit=False):
     rows = table_cache.get(period_type, [])
     per_page = 20
@@ -640,54 +480,37 @@ async def send_table_page(target, period_type, page, is_edit=False):
     total_tourns = sum(r[2] for r in rows)
     active_count = sum(1 for r in rows if r[1] + r[2] > 0)
 
-    # ---------- Шапка ----------
     text = "📊Таблица активности участников\n"
     text += f"{period_name}\n"
     text += f"📅 {date_range}\n\n"
-
-    # ---------- Рейтинг участников ----------
     text += f"Рейтинг участников · стр. {page + 1}/{total_pages}\n\n"
 
     if page_rows:
         for i, (username, puzzles, tourns) in enumerate(page_rows, start_idx + 1):
             total = puzzles + tourns
-
             ball_word = pluralize(total, ('балл', 'балла', 'баллов'))
             task_word = pluralize(puzzles, ('задача', 'задачи', 'задач'))
             tourn_word = pluralize(tourns, ('турнир', 'турнира', 'турниров'))
 
-            if i == 1:
-                prefix = "🥇 "
-            elif i == 2:
-                prefix = "🥈 "
-            elif i == 3:
-                prefix = "🥉 "
-            else:
-                prefix = f"{i}. "
-
+            prefix = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
             text += f"{prefix} {username} — {total} {ball_word}\n"
             text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word}\n"
     else:
         text += "На этой странице нет участников.\n"
 
     text += "\n" + "━" * 22 + "\n\n"
-
-    # ---------- Итоги ----------
     total_puzzles_word = pluralize(total_puzzles, ('задача', 'задачи', 'задач'))
     total_tourns_word = pluralize(total_tourns, ('турнир', 'турнира', 'турниров'))
 
-    # MODIFIED: подчёркиваем, что в таблице только участники с токеном
     text += (f"📈Всего: 🧩 {total_puzzles} {total_puzzles_word} · 🏆 {total_tourns} {total_tourns_word}\n"
              f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
 
-    # ---------- Клавиатура ----------
     keyboard = Keyboard(one_time=False, inline=False)
     nav_buttons = []
     if page > 0:
         nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "table_page", "type": period_type, "page": page - 1}))
     if len(rows) > end_idx:
         nav_buttons.append(Text("Вперед ➡️", payload={"cmd": "table_page", "type": period_type, "page": page + 1}))
-
     if nav_buttons:
         for btn in nav_buttons:
             keyboard.add(btn, color=KeyboardButtonColor.PRIMARY)
@@ -695,7 +518,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
 
     keyboard.add(Text("🔄 Другой период", payload={"cmd": "table_members"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
-
     kb_json = keyboard.get_json()
 
     if is_edit:
@@ -723,7 +545,9 @@ async def send_table_page(target, period_type, page, is_edit=False):
         last_table_message[target.peer_id] = mid
 
 
-# --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
+# =====================================================================
+# РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
+# =====================================================================
 def register_handlers(bot: Bot):
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
@@ -759,56 +583,34 @@ def register_handlers(bot: Bot):
             keyboard=Keyboard(one_time=True).get_json()
         )
 
-    # NEW — подменю "Статистика для руководителей клуба"
     @bot.on.message(payload_contains={"cmd": "leaders_menu"})
     async def leaders_menu_handler(message: Message):
         user = get_user_lichess(message.from_id)
-        if not user:
-            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+        if not user or not await is_club_leader(user):
+            await message.answer("❌ Эта функция доступна только руководителям.")
             return
-        if not await is_club_leader(user):
-            await message.answer("❌ Эта функция доступна только руководителям и администраторам клуба.")
-            return
-        await message.answer(
-            "📊 Статистика для руководителей клуба\nВыберите раздел:",
-            keyboard=get_leaders_menu_keyboard(),
-        )
+        await message.answer("📊 Статистика для руководителей клуба\nВыберите раздел:",
+                             keyboard=get_leaders_menu_keyboard())
 
-    # NEW — фото чемпионата Under Pressure
     @bot.on.message(payload_contains={"cmd": "champ_under_pressure"})
     async def champ_under_pressure_handler(message: Message):
         try:
-            attachment = await upload_photo_to_vk(
-                message.ctx_api, message.peer_id, UNDER_PRESSURE_PHOTO
-            )
+            attachment = await upload_photo_to_vk(message.ctx_api, message.peer_id, UNDER_PRESSURE_PHOTO)
         except FileNotFoundError:
-            await message.answer(
-                f"⚠️ Файл {UNDER_PRESSURE_PHOTO} не найден рядом с ботом.",
-                keyboard=get_back_to_main_keyboard(),
-            )
+            await message.answer(f"⚠️ Файл {UNDER_PRESSURE_PHOTO} не найден рядом с ботом.",
+                                 keyboard=get_back_to_main_keyboard())
             return
         except Exception as e:
-            await message.answer(
-                f"⚠️ Не удалось загрузить фото: {e}",
-                keyboard=get_back_to_main_keyboard(),
-            )
+            await message.answer(f"⚠️ Не удалось загрузить фото: {e}", keyboard=get_back_to_main_keyboard())
             return
 
-        await message.answer(
-            "🏆 Чемпионат Under Pressure",
-            attachment=attachment,
-            keyboard=get_back_to_main_keyboard(),
-        )
+        await message.answer("🏆 Чемпионат Under Pressure", attachment=attachment, keyboard=get_back_to_main_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "view_member_stats"})
     async def view_member_stats_handler(message: Message):
         user = get_user_lichess(message.from_id)
-        if not user:
-            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
-            return
-        is_leader = await is_club_leader(user)
-        if not is_leader:
-            await message.answer("❌ Эта функция доступна только руководителям и администраторам клуба.")
+        if not user or not await is_club_leader(user):
+            await message.answer("❌ Эта функция доступна только руководителям.")
             return
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
@@ -822,12 +624,8 @@ def register_handlers(bot: Bot):
     @bot.on.message(payload_contains={"cmd": "table_members"})
     async def table_members_handler(message: Message):
         user = get_user_lichess(message.from_id)
-        if not user:
-            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
-            return
-        is_leader = await is_club_leader(user)
-        if not is_leader:
-            await message.answer("❌ Эта функция доступна только руководителям и администраторам клуба.")
+        if not user or not await is_club_leader(user):
+            await message.answer("❌ Эта функция доступна только руководителям.")
             return
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
@@ -836,12 +634,10 @@ def register_handlers(bot: Bot):
         waiting_for_table.add(message.from_id)
         await message.answer("Выберите период для таблицы участников:", keyboard=get_table_period_keyboard())
 
-    # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ СБОРА ДАННЫХ ОБ ОДНОМ ИГРОКЕ (ТОЛЬКО ДЛЯ ТАБЛИЦЫ) ---
     async def fetch_member_data(client, username, start_date, end_date):
         tourn_count = 0
         puzzles_solved = 0
 
-        # 1. Арены
         try:
             url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played?max=1000"
             resp = await client.get(url_arena)
@@ -851,12 +647,10 @@ def register_handlers(bot: Bot):
                         t = json.loads(line)
                         starts_at = t.get('tournament', {}).get('startsAt', 0)
                         t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date:
-                            tourn_count += 1
+                        if start_date <= t_date <= end_date: tourn_count += 1
         except Exception:
             pass
 
-        # 2. Швейцарки
         try:
             url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played?max=1000"
             resp = await client.get(url_swiss)
@@ -866,12 +660,10 @@ def register_handlers(bot: Bot):
                         t = json.loads(line)
                         starts_at = t.get('tournament', {}).get('startsAt', 0)
                         t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                        if start_date <= t_date <= end_date:
-                            tourn_count += 1
+                        if start_date <= t_date <= end_date: tourn_count += 1
         except Exception:
             pass
 
-        # 3. Задачи
         token = get_token_from_cache(username)
         if token:
             try:
@@ -884,8 +676,7 @@ def register_handlers(bot: Bot):
                             entry = json.loads(line)
                             event_ts = entry.get("date", 0)
                             event_date = datetime.fromtimestamp(event_ts / 1000).date()
-                            if start_date <= event_date <= end_date:
-                                puzzles_solved += 1
+                            if start_date <= event_date <= end_date: puzzles_solved += 1
             except Exception:
                 pass
         else:
@@ -897,11 +688,9 @@ def register_handlers(bot: Bot):
                     for act in activities:
                         interval_start = datetime.fromtimestamp(act['interval']['start'] / 1000).date()
                         interval_end = datetime.fromtimestamp(act['interval']['end'] / 1000).date()
-
                         if interval_start <= end_date and interval_end >= start_date:
                             puzzles_data = act.get('puzzles', {}).get('score', {})
-                            if puzzles_data:
-                                puzzles_solved += puzzles_data.get('win', 0) + puzzles_data.get('loss', 0)
+                            if puzzles_data: puzzles_solved += puzzles_data.get('win', 0) + puzzles_data.get('loss', 0)
             except Exception:
                 pass
 
@@ -920,39 +709,27 @@ def register_handlers(bot: Bot):
             return
 
         await message.answer(
-            f"⏳ Собираю таблицу участников за {period_name}.\n"
-            f"В таблицу попадают только участники, привязавшие свой токен Lichess. Подождите..."
-        )
+            f"⏳ Собираю таблицу участников за {period_name}.\nВ таблицу попадают только участники, привязавшие свой токен Lichess. Подождите...")
 
         try:
-            # MODIFIED: только участники, у которых есть токен (token_cache)
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("SELECT username FROM token_cache")
             token_usernames = [row[0] for row in c.fetchall()]
-            # Красивое написание ников из users (если есть)
             c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
             known_names = {row[0].lower(): row[0] for row in c.fetchall()}
             conn.close()
 
             leader_set = {n.lower() for n in LEADER_USERNAMES}
-            token_usernames = [
-                known_names.get(u.lower(), u)
-                for u in token_usernames
-                if u.lower() not in leader_set
-            ]
+            token_usernames = [known_names.get(u.lower(), u) for u in token_usernames if u.lower() not in leader_set]
 
             if not token_usernames:
                 await message.answer(
-                    "Пока никто из участников не добавил токен Lichess.\n"
-                    "Таблица появится, как только участники привяжут свой токен "
-                    "через «🔑 Мой токен Lichess».",
-                    keyboard=get_table_period_keyboard(),
-                )
+                    "Пока никто из участников не добавил токен Lichess.\nТаблица появится, как только участники привяжут свой токен через «🔑 Мой токен Lichess».",
+                    keyboard=get_table_period_keyboard())
                 return
 
             members = [{"id": u} for u in token_usernames]
-
             rows = []
 
             async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
@@ -961,8 +738,7 @@ def register_handlers(bot: Bot):
                 async def bounded_fetch(m):
                     async with sem:
                         username = m.get('id')
-                        if not username:
-                            return None
+                        if not username: return None
                         try:
                             return await fetch_member_data(client, username, start_date, end_date)
                         except Exception:
@@ -971,9 +747,7 @@ def register_handlers(bot: Bot):
                 results = await asyncio.gather(*(bounded_fetch(m) for m in members))
 
             for res in results:
-                if res:
-                    username, puzzles, tourns = res
-                    rows.append((username, puzzles, tourns))
+                if res: rows.append((res[0], res[1], res[2]))
 
             if not rows:
                 await message.answer("Не удалось собрать данные ни по одному участнику.")
@@ -981,7 +755,6 @@ def register_handlers(bot: Bot):
 
             rows.sort(key=lambda x: (-(x[1] + x[2]), x[0].lower()))
             table_cache[period_type] = rows
-
             await send_table_page(message, period_type, 0)
 
         except Exception as e:
@@ -1008,12 +781,10 @@ def register_handlers(bot: Bot):
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
 
         await message.answer(
-            f"⏳ Собираю статистику для {target_username} за {period_name} "
-            f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
+            f"⏳ Собираю статистику для {target_username} за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
 
         try:
             user_token = get_token_from_cache(target_username)
-
             user_data = await fetch_lichess_json(f"https://lichess.org/api/user/{target_username.lower()}")
             played_tournaments = await fetch_lichess_ndjson(
                 f"https://lichess.org/api/user/{target_username.lower()}/tournament/played")
@@ -1025,8 +796,7 @@ def register_handlers(bot: Bot):
                 t_date = datetime.fromtimestamp(starts_at / 1000).date()
                 if start_date <= t_date <= end_date:
                     period_tourn_count += 1
-                    if t.get('player', {}).get('rank') == 1:
-                        period_tourn_wins += 1
+                    if t.get('player', {}).get('rank') == 1: period_tourn_wins += 1
 
             puzzles_solved = 0
             puzzles_won = 0
@@ -1042,15 +812,11 @@ def register_handlers(bot: Bot):
                             event_date = datetime.fromtimestamp(event_ts / 1000).date()
                             if start_date <= event_date <= end_date:
                                 is_win = entry.get("win", False)
-                                if is_win:
-                                    puzzles_won += 1
-                                    puzzles_solved += 1
-                                else:
-                                    puzzles_solved += 1
+                                if is_win: puzzles_won += 1
+                                puzzles_solved += 1
                                 rating = entry.get("puzzle", {}).get("rating")
                                 if rating:
-                                    if start_rating is None:
-                                        start_rating = rating
+                                    if start_rating is None: start_rating = rating
                                     end_rating = rating
                         except Exception:
                             continue
@@ -1066,26 +832,17 @@ def register_handlers(bot: Bot):
 
             text = f"👤 Статистика игрока {target_username}\n"
             text += f"📅 Период: {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
-
-            text += f"🏆 Турниры за период:\n"
-            text += f"• Участий: {period_tourn_count}\n"
-            text += f"• Побед (1 место): {period_tourn_wins}\n\n"
+            text += f"🏆 Турниры за период:\n• Участий: {period_tourn_count}\n• Побед (1 место): {period_tourn_wins}\n\n"
 
             if puzzles_solved > 0:
-                text += f"🧩 Задачи за период:\n"
-                text += f"• Правильно: {puzzles_won}\n"
-                text += f"• Неправильно: {puzzles_solved - puzzles_won}\n"
-                if start_rating and end_rating:
-                    text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
+                text += f"🧩 Задачи за период:\n• Правильно: {puzzles_won}\n• Неправильно: {puzzles_solved - puzzles_won}\n"
+                if start_rating and end_rating: text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
                 text += "\n"
             else:
                 text += f"🧩 Задачи за период: нет данных (токен не найден)\n\n"
 
-            if rating_lines:
-                text += f"📈 Текущие рейтинги:\n" + "\n".join(rating_lines) + "\n"
-
+            if rating_lines: text += f"📈 Текущие рейтинги:\n" + "\n".join(rating_lines) + "\n"
             await message.answer(text, keyboard=get_member_period_keyboard())
-
         except Exception as e:
             await message.answer(f"⚠️ Ошибка при сборе статистики: {e}", keyboard=get_member_period_keyboard())
 
@@ -1111,8 +868,7 @@ def register_handlers(bot: Bot):
         user_token = get_token_from_cache(user)
         if not user_token:
             await message.answer(
-                f"Для статистики за периоды нужен токен Lichess для ника {user}. "
-                f"Нажмите «🔑 Мой токен Lichess» в главном меню.",
+                f"Для статистики за периоды нужен токен Lichess для ника {user}. Нажмите «🔑 Мой токен Lichess» в главном меню.",
                 keyboard=get_periods_keyboard())
             return
 
@@ -1120,15 +876,10 @@ def register_handlers(bot: Bot):
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
 
         await message.answer(
-            f"⏳ Собираю статистику за {period_name} "
-            f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
+            f"⏳ Собираю статистику за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
 
         try:
-            puzzles_data = await fetch_lichess_ndjson(
-                "https://lichess.org/api/puzzle/activity",
-                token=user_token
-            )
-
+            puzzles_data = await fetch_lichess_ndjson("https://lichess.org/api/puzzle/activity", token=user_token)
             puzzles_solved = 0
             puzzles_won = 0
             start_rating = None
@@ -1138,19 +889,13 @@ def register_handlers(bot: Bot):
                 try:
                     event_ts = entry.get("date", 0)
                     event_date = datetime.fromtimestamp(event_ts / 1000).date()
-
                     if start_date <= event_date <= end_date:
                         is_win = entry.get("win", False)
-                        if is_win:
-                            puzzles_won += 1
-                            puzzles_solved += 1
-                        else:
-                            puzzles_solved += 1
-
+                        if is_win: puzzles_won += 1
+                        puzzles_solved += 1
                         rating = entry.get("puzzle", {}).get("rating")
                         if rating:
-                            if start_rating is None:
-                                start_rating = rating
+                            if start_rating is None: start_rating = rating
                             end_rating = rating
                 except Exception:
                     continue
@@ -1163,36 +908,23 @@ def register_handlers(bot: Bot):
             for t in played_tournaments:
                 starts_at = t.get('tournament', {}).get('startsAt', 0)
                 t_date = datetime.fromtimestamp(starts_at / 1000).date()
-
                 if start_date <= t_date <= end_date:
                     tourn_count += 1
-                    if t.get('player', {}).get('rank') == 1:
-                        tourn_wins += 1
+                    if t.get('player', {}).get('rank') == 1: tourn_wins += 1
 
             if puzzles_solved == 0 and tourn_count == 0:
                 await message.answer(
-                    f"За {period_name.lower()} "
-                    f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}) у вас нет активности.",
+                    f"За {period_name.lower()} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}) у вас нет активности.",
                     keyboard=get_periods_keyboard())
                 return
 
-            text = (f"📊 Статистика за {period_name} "
-                    f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n")
-
+            text = f"📊 Статистика за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
             if puzzles_solved > 0:
-                text += f"🧩 Задачи:\n"
-                text += f"• Правильно решено: {puzzles_won}\n"
-                text += f"• Неправильно решено: {puzzles_solved - puzzles_won}\n"
-                if start_rating and end_rating:
-                    text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
+                text += f"🧩 Задачи:\n• Правильно решено: {puzzles_won}\n• Неправильно решено: {puzzles_solved - puzzles_won}\n"
+                if start_rating and end_rating: text += f"• Рейтинг: {start_rating} ➡️ {end_rating}\n"
                 text += "\n"
-
-            text += f"🏆 Турниры:\n"
-            text += f"• Сыграно турниров: {tourn_count}\n"
-            text += f"• Побед (1 место): {tourn_wins}\n"
-
+            text += f"🏆 Турниры:\n• Сыграно турниров: {tourn_count}\n• Побед (1 место): {tourn_wins}\n"
             await message.answer(text, keyboard=get_periods_keyboard())
-
         except Exception as e:
             await message.answer(f"⚠️ Ошибка при сборе статистики: {e}", keyboard=get_periods_keyboard())
 
@@ -1229,6 +961,7 @@ def register_handlers(bot: Bot):
         except Exception as e:
             await message.answer(f"⚠️ Ошибка: {e}")
             return
+
         total_tournaments = len(played_tournaments)
         wins = sum(1 for item in played_tournaments if item.get('player', {}).get('rank') == 1)
         lines = [
@@ -1259,9 +992,11 @@ def register_handlers(bot: Bot):
         except Exception as e:
             await message.answer(f"⚠️ Ошибка: {e}")
             return
+
         if not puzzle_perf:
             await message.answer("Вы пока не решали задачи на Lichess.", keyboard=get_back_to_main_keyboard())
             return
+
         lines = [f"🧩 Статистика задач {lichess_user}\n", f"📈 Рейтинг задач: {puzzle_perf.get('rating', '?')}",
                  f"🎯 Всего решено: {puzzle_perf.get('games', 0)}\n"]
         await message.answer("\n".join(lines), keyboard=get_back_to_main_keyboard())
@@ -1273,8 +1008,7 @@ def register_handlers(bot: Bot):
             data = await fetch_lichess_json("https://lichess.org/api/puzzle/daily")
             rating = data.get('puzzle', {}).get('rating', '?')
             themes = ", ".join(data.get('puzzle', {}).get('themes', []))
-            text = (f"🎯 Ежедневная задача Lichess\n\n📈 Рейтинг задачи: {rating}\n"
-                    f"🏷️ Темы: {themes}\n\nРешить: https://lichess.org/training/daily")
+            text = f"🎯 Ежедневная задача Lichess\n\n📈 Рейтинг задачи: {rating}\n🏷️ Темы: {themes}\n\nРешить: https://lichess.org/training/daily"
             await message.answer(text, keyboard=get_back_to_main_keyboard())
         except Exception as e:
             await message.answer(f"⚠️ Ошибка загрузки задачи: {e}", keyboard=get_back_to_main_keyboard())
@@ -1299,12 +1033,7 @@ def register_handlers(bot: Bot):
                 usernames = [m.get('id') for m in members if m.get('id')]
                 profiles = await get_users_profiles(usernames)
 
-                modes = [
-                    ('blitz', '⚡ Блиц'),
-                    ('rapid', '🐢 Рапид'),
-                    ('bullet', '🚀 Пуля')
-                ]
-
+                modes = [('blitz', '⚡ Блиц'), ('rapid', '🐢 Рапид'), ('bullet', '🚀 Пуля')]
                 for mode_key, mode_name in modes:
                     def get_mode_rating(p):
                         perfs = p.get('perfs', {})
@@ -1318,7 +1047,6 @@ def register_handlers(bot: Bot):
                         top_players_text += f"\n👑 Топ-5 ({mode_name}):\n"
                         for i, p in enumerate(mode_profiles[:5], 1):
                             top_players_text += f"{i}. {p.get('username', 'Unknown')} — {get_mode_rating(p)}\n"
-
         except Exception as e:
             await message.answer(f"⚠️ Ошибка: {e}", keyboard=get_back_to_main_keyboard())
             return
@@ -1355,6 +1083,7 @@ def register_handlers(bot: Bot):
         if not filtered:
             await message.answer(f"{title} не найдены.", keyboard=get_tournaments_menu_keyboard())
             return
+
         per_page = 5
         start_idx = page * per_page
         end_idx = start_idx + per_page
@@ -1381,9 +1110,7 @@ def register_handlers(bot: Bot):
 
         if status == 10:
             await message.answer(
-                f"📅 Турнир ещё не начался!\n\nДата: {date_str}\nУчастников: {players}\n"
-                f"Ссылка: https://lichess.org/"
-                f"{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
+                f"📅 Турнир ещё не начался!\n\nДата: {date_str}\nУчастников: {players}\nСсылка: https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
                 keyboard=back_kb)
             return
 
@@ -1395,8 +1122,7 @@ def register_handlers(bot: Bot):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 await message.answer(
-                    f"⚠️ Результаты недоступны.\nСсылка: https://lichess.org/"
-                    f"{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
+                    f"⚠️ Результаты недоступны.\nСсылка: https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
                     keyboard=back_kb)
             else:
                 await message.answer(f"⚠️ Ошибка загрузки: {e}", keyboard=back_kb)
@@ -1419,7 +1145,6 @@ def register_handlers(bot: Bot):
             return
 
         link = f"https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}"
-
         lines = [
             f"🏆 Результаты турнира",
             f"📅 Дата: {date_str}",
@@ -1438,8 +1163,7 @@ def register_handlers(bot: Bot):
 
     @bot.on.message(text="<text>")
     async def any_text_handler(message: Message, text: str):
-        if message.payload:
-            return
+        if message.payload: return
 
         # --- 1. СЕКРЕТНЫЙ КОД ---
         if message.from_id in waiting_for_code:
@@ -1464,15 +1188,13 @@ def register_handlers(bot: Bot):
             is_valid = await check_token_valid(token, user)
             if not is_valid:
                 await message.answer(
-                    f"❌ Токен недействителен или не принадлежит аккаунту {user}. "
-                    f"Попробуйте другой токен или напишите /start для отмены.")
+                    f"❌ Токен недействителен или не принадлежит аккаунту {user}. Попробуйте другой токен или напишите /start для отмены.")
                 return
 
             save_user_token(message.from_id, token)
             waiting_for_token.discard(message.from_id)
-            await message.answer(
-                f"✅ Токен успешно привязан! Теперь статистика задач будет доступна в полном объеме.",
-                keyboard=get_main_keyboard())
+            await message.answer(f"✅ Токен успешно привязан! Теперь статистика задач будет доступна в полном объеме.",
+                                 keyboard=get_main_keyboard())
             return
 
         # --- 3. СМЕНА / ПРИВЯЗКА НИКА ---
@@ -1493,7 +1215,6 @@ def register_handlers(bot: Bot):
             save_user(message.from_id, username)
             waiting_for_nick.discard(message.from_id)
 
-            # FIX: чистим кэш таблицы и старую запись токена при смене ника
             if old_username and old_username.lower() != username.lower():
                 conn = sqlite3.connect(DB_PATH)
                 conn.execute("DELETE FROM token_cache WHERE username=?", (old_username.lower(),))
@@ -1504,16 +1225,13 @@ def register_handlers(bot: Bot):
             if old_token:
                 is_valid_for_new_nick = await check_token_valid(old_token, username)
                 if not is_valid_for_new_nick:
-                    # Токен принадлежал старому нику — отвязываем
                     conn = sqlite3.connect(DB_PATH)
                     conn.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
                     conn.commit()
                     conn.close()
                     table_cache.clear()
                     await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}.\n"
-                        f"⚠️ Старый токен не подходит к новому нику и был отвязан. "
-                        f"Привяжите новый через «🔑 Мой токен Lichess».",
+                        f"✅ Успешно! Вы привязаны как {username}.\n",
                         keyboard=get_main_keyboard())
                     return
                 else:
