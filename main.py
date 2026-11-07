@@ -4,6 +4,7 @@ import httpx
 import asyncio
 import re
 import time
+import aiohttp  # NEW — для загрузки фото
 from datetime import datetime, date
 from aiohttp import TCPConnector
 
@@ -46,35 +47,24 @@ from vkbottle.api import API
 # =====================================================================
 # ⚠️ ЗАПОЛНИТЕ ПЕРЕМЕННЫЕ ⚠️
 # =====================================================================
-# 🔐 НАСТРОЙКИ ДОСТУПА
-# =====================================================================
 SECRET_CODE = "chess-bot"
 # =====================================================================
 
-# ... ваши существующие переменные ...
-
-# ... остальные переменные ...
 VK_TOKEN = os.getenv("BOT_TOKEN")
 TEAM_ID = "pHf9ZSwg"
-waiting_for_code = set()  # Пользователи, которым нужно ввести секретный код
+waiting_for_code = set()
 waiting_for_nick = set()
 waiting_for_table = set()
 pending_member_target = {}
 champ_overall_cache = {"data": [], "timestamp": 0}
 table_cache = {}
 last_table_message = {}
-# =====================================================================
-
 
 # 👇 Впишите ники руководителей и админов клуба (регистр не важен)
 LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
-# =====================================================================
 
-# =====================================================================
 # 🏆 НАСТРОЙКИ МИНИ-ЧЕМПИОНАТА
-# =====================================================================
 CHAMP_KEYWORDS = ["PolyStation"]
-# =====================================================================
 
 DB_PATH = "bot.db"
 tournament_cache = {}
@@ -84,8 +74,11 @@ waiting_for_member_nick = set()
 waiting_for_table = set()
 pending_member_target = {}
 champ_overall_cache = {"data": [], "timestamp": 0}
-table_cache = {}  # Кэш для таблиц участников
+table_cache = {}
 last_table_message = {}
+
+# NEW — путь к фото чемпионата (положите файл рядом с ботом)
+UNDER_PRESSURE_PHOTO = "under_pressure.png"
 
 
 # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
@@ -152,6 +145,8 @@ def save_user_token(vk_id, token):
     username = get_user_lichess(vk_id)
     if username:
         save_token_cache(username, token)
+    # FIX: новый токен => таблица должна пересобраться
+    table_cache.clear()
 
 
 def save_token_cache(username, token):
@@ -262,6 +257,34 @@ async def get_all_team_tournaments():
     return tournaments
 
 
+# --- NEW: ЗАГРУЗКА ФОТО В VK ---
+async def upload_photo_to_vk(api, peer_id, file_path):
+    """Загружает локальное фото в VK и возвращает attachment-строку."""
+    server = await api.photos.get_messages_upload_server(peer_id=peer_id)
+    upload_url = server.upload_url
+
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+
+    form = aiohttp.FormData()
+    form.add_field("photo", file_content, filename="photo.jpg", content_type="image/jpeg")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(upload_url, data=form) as resp:
+            upload_data = await resp.json()
+
+    saved = await api.photos.save_messages_photo(
+        photo=upload_data["photo"],
+        server=upload_data["server"],
+        hash=upload_data["hash"],
+    )
+    # vkbottle может вернуть обёртку
+    if hasattr(saved, "response"):
+        saved = saved.response
+    photo = saved[0] if isinstance(saved, list) else saved
+    return f"photo{photo.owner_id}_{photo.id}"
+
+
 # --- ЛОГИКА МИНИ-ЧЕМПИОНАТА ---
 def is_champ_stage(tournament):
     name = tournament.get('fullName', tournament.get('name', '')).lower()
@@ -334,6 +357,8 @@ async def is_club_leader(username):
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
+    # MODIFIED: убраны "Статистика участника" и "Таблица участников",
+    # добавлены "Статистика для руководителей клуба" и "Чемпионат Under Pressure"
     keyboard = Keyboard(one_time=False, inline=False)
     keyboard.add(Text("👤 Статистика игрока", payload={"cmd": "menu_player"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
@@ -343,15 +368,29 @@ def get_main_keyboard():
     keyboard.row()
     keyboard.add(Text("🏆 Статистика клуба", payload={"cmd": "menu_club"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("👥 Статистика участника", payload={"cmd": "view_member_stats"}),
+    keyboard.add(Text("📊 Статистика для руководителей клуба", payload={"cmd": "leaders_menu"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("📊 Таблица участников", payload={"cmd": "table_members"}), color=KeyboardButtonColor.PRIMARY)
+    keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
+                 color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.row()
     keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
+    return keyboard.get_json()
+
+
+def get_leaders_menu_keyboard():
+    # NEW: подменю "Статистика для руководителей клуба"
+    keyboard = Keyboard(one_time=False, inline=False)
+    keyboard.add(Text("👥 Статистика участника", payload={"cmd": "view_member_stats"}),
+                 color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
+    keyboard.add(Text("📊 Таблица участников", payload={"cmd": "table_members"}),
+                 color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
+    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
 
 
@@ -569,6 +608,7 @@ def get_ball_word(n):
     else:
         return "баллов"
 
+
 def pluralize(n, forms):
     """Склонение русских слов: forms = ('задача', 'задачи', 'задач')"""
     n = abs(n) % 100
@@ -580,6 +620,7 @@ def pluralize(n, forms):
     if n1 == 1:
         return forms[0]
     return forms[2]
+
 
 # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ ---
 async def send_table_page(target, period_type, page, is_edit=False):
@@ -611,12 +652,10 @@ async def send_table_page(target, period_type, page, is_edit=False):
         for i, (username, puzzles, tourns) in enumerate(page_rows, start_idx + 1):
             total = puzzles + tourns
 
-            # Склонения
             ball_word = pluralize(total, ('балл', 'балла', 'баллов'))
             task_word = pluralize(puzzles, ('задача', 'задачи', 'задач'))
             tourn_word = pluralize(tourns, ('турнир', 'турнира', 'турниров'))
 
-            # Определяем префикс (медаль для топ-3, цифра для остальных)
             if i == 1:
                 prefix = "🥇 "
             elif i == 2:
@@ -626,10 +665,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
             else:
                 prefix = f"{i}. "
 
-            # Первая строка: Место/Медаль, Ник и Баллы
             text += f"{prefix} {username} — {total} {ball_word}\n"
-
-            # Вторая строка: Задачи и Турниры (юникод-пробелы)
             text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word}\n"
     else:
         text += "На этой странице нет участников.\n"
@@ -640,8 +676,9 @@ async def send_table_page(target, period_type, page, is_edit=False):
     total_puzzles_word = pluralize(total_puzzles, ('задача', 'задачи', 'задач'))
     total_tourns_word = pluralize(total_tourns, ('турнир', 'турнира', 'турниров'))
 
+    # MODIFIED: подчёркиваем, что в таблице только участники с токеном
     text += (f"📈Всего: 🧩 {total_puzzles} {total_puzzles_word} · 🏆 {total_tourns} {total_tourns_word}\n"
-             f"👥 Участников: {len(rows)} (активных: {active_count})")
+             f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
 
     # ---------- Клавиатура ----------
     keyboard = Keyboard(one_time=False, inline=False)
@@ -661,7 +698,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
 
     kb_json = keyboard.get_json()
 
-
     if is_edit:
         prev_id = last_table_message.get(target.peer_id)
         if prev_id is not None:
@@ -677,7 +713,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
             except Exception:
                 pass
 
-    # ---------- Отправка нового сообщения ----------
     resp = await target.answer(text, keyboard=kb_json, parse_mode='HTML')
     mid = None
     if hasattr(resp, 'response') and resp.response:
@@ -690,7 +725,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
 
 # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
 def register_handlers(bot: Bot):
-    @bot.on.message(text=["Начать","начать","Start", "start","/Start", "/start"])
+    @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
@@ -700,11 +735,9 @@ def register_handlers(bot: Bot):
 
         user = get_user_lichess(message.from_id)
         if user:
-            # Если уже привязан — показываем меню
             await message.answer(f"👋 Привет! Ты привязан как {user}.\n\nВыбери нужный раздел в меню ниже:",
                                  keyboard=get_main_keyboard())
         else:
-            # Если не привязан — требуем секретный код
             waiting_for_code.add(message.from_id)
             await message.answer("🔒 Это закрытый бот шахматного клуба.\n\nПожалуйста, введите секретный код доступа:")
 
@@ -724,6 +757,47 @@ def register_handlers(bot: Bot):
             f"Он должен принадлежать вашему аккаунту: {user}.\n"
             f"Его можно создать здесь: https://lichess.org/account/oauth/token/create\n",
             keyboard=Keyboard(one_time=True).get_json()
+        )
+
+    # NEW — подменю "Статистика для руководителей клуба"
+    @bot.on.message(payload_contains={"cmd": "leaders_menu"})
+    async def leaders_menu_handler(message: Message):
+        user = get_user_lichess(message.from_id)
+        if not user:
+            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+            return
+        if not await is_club_leader(user):
+            await message.answer("❌ Эта функция доступна только руководителям и администраторам клуба.")
+            return
+        await message.answer(
+            "📊 Статистика для руководителей клуба\nВыберите раздел:",
+            keyboard=get_leaders_menu_keyboard(),
+        )
+
+    # NEW — фото чемпионата Under Pressure
+    @bot.on.message(payload_contains={"cmd": "champ_under_pressure"})
+    async def champ_under_pressure_handler(message: Message):
+        try:
+            attachment = await upload_photo_to_vk(
+                message.ctx_api, message.peer_id, UNDER_PRESSURE_PHOTO
+            )
+        except FileNotFoundError:
+            await message.answer(
+                f"⚠️ Файл {UNDER_PRESSURE_PHOTO} не найден рядом с ботом.",
+                keyboard=get_back_to_main_keyboard(),
+            )
+            return
+        except Exception as e:
+            await message.answer(
+                f"⚠️ Не удалось загрузить фото: {e}",
+                keyboard=get_back_to_main_keyboard(),
+            )
+            return
+
+        await message.answer(
+            "🏆 Чемпионат Under Pressure",
+            attachment=attachment,
+            keyboard=get_back_to_main_keyboard(),
         )
 
     @bot.on.message(payload_contains={"cmd": "view_member_stats"})
@@ -767,7 +841,7 @@ def register_handlers(bot: Bot):
         tourn_count = 0
         puzzles_solved = 0
 
-        # 1. Запрашиваем Арены (Arena)
+        # 1. Арены
         try:
             url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played?max=1000"
             resp = await client.get(url_arena)
@@ -782,7 +856,7 @@ def register_handlers(bot: Bot):
         except Exception:
             pass
 
-        # 2. Запрашиваем Швейцарки (Swiss)
+        # 2. Швейцарки
         try:
             url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played?max=1000"
             resp = await client.get(url_swiss)
@@ -797,10 +871,9 @@ def register_handlers(bot: Bot):
         except Exception:
             pass
 
-        # 3. Запрашиваем задачи
+        # 3. Задачи
         token = get_token_from_cache(username)
         if token:
-            # Если токен есть — точные данные по дням
             try:
                 url_p = "https://lichess.org/api/puzzle/activity"
                 headers_p = {"Authorization": f"Bearer {token}"}
@@ -816,7 +889,6 @@ def register_handlers(bot: Bot):
             except Exception:
                 pass
         else:
-            # Если токена нет — используем публичную активность (без токена)
             try:
                 url_act = f"https://lichess.org/api/user/{username.lower()}/activity"
                 resp = await client.get(url_act)
@@ -826,7 +898,6 @@ def register_handlers(bot: Bot):
                         interval_start = datetime.fromtimestamp(act['interval']['start'] / 1000).date()
                         interval_end = datetime.fromtimestamp(act['interval']['end'] / 1000).date()
 
-                        # Если интервал активности попадает в наш период
                         if interval_start <= end_date and interval_end >= start_date:
                             puzzles_data = act.get('puzzles', {}).get('score', {})
                             if puzzles_data:
@@ -836,7 +907,6 @@ def register_handlers(bot: Bot):
 
         return (username, puzzles_solved, tourn_count)
 
-    # FIX: table_period_handler вынесен из fetch_member_data на уровень соседних хэндлеров
     @bot.on.message(payload_contains={"cmd": "table_period"})
     async def table_period_handler(message: Message):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
@@ -850,23 +920,38 @@ def register_handlers(bot: Bot):
             return
 
         await message.answer(
-            f"⏳ Собираю полный список участников клуба за {period_name}.\n"
-            f"Чем больше участников — тем дольше (обычно 15–30 сек). Подождите..."
+            f"⏳ Собираю таблицу участников за {period_name}.\n"
+            f"В таблицу попадают только участники, привязавшие свой токен Lichess. Подождите..."
         )
 
         try:
-            members = await get_club_members(TEAM_ID)
-            if not members:
-                await message.answer("❌ Не удалось получить список участников клуба.")
-                return
+            # MODIFIED: только участники, у которых есть токен (token_cache)
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT username FROM token_cache")
+            token_usernames = [row[0] for row in c.fetchall()]
+            # Красивое написание ников из users (если есть)
+            c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
+            known_names = {row[0].lower(): row[0] for row in c.fetchall()}
+            conn.close()
 
-            # Исключаем руководителей и админов
             leader_set = {n.lower() for n in LEADER_USERNAMES}
-            members = [m for m in members if (m.get('id') or '').lower() not in leader_set]
+            token_usernames = [
+                known_names.get(u.lower(), u)
+                for u in token_usernames
+                if u.lower() not in leader_set
+            ]
 
-            if not members:
-                await message.answer("В клубе нет участников для отображения.")
+            if not token_usernames:
+                await message.answer(
+                    "Пока никто из участников не добавил токен Lichess.\n"
+                    "Таблица появится, как только участники привяжут свой токен "
+                    "через «🔑 Мой токен Lichess».",
+                    keyboard=get_table_period_keyboard(),
+                )
                 return
+
+            members = [{"id": u} for u in token_usernames]
 
             rows = []
 
@@ -894,7 +979,6 @@ def register_handlers(bot: Bot):
                 await message.answer("Не удалось собрать данные ни по одному участнику.")
                 return
 
-            # Сортировка по общей сумме баллов (задачи + турниры)
             rows.sort(key=lambda x: (-(x[1] + x[2]), x[0].lower()))
             table_cache[period_type] = rows
 
@@ -908,7 +992,6 @@ def register_handlers(bot: Bot):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
         period_type = payload_data.get("type", "autumn")
         page = payload_data.get("page", 0)
-        # Исправлено is_callback на is_edit
         await send_table_page(message, period_type, page, is_edit=True)
 
     @bot.on.message(payload_contains={"cmd": "member_period"})
@@ -925,7 +1008,8 @@ def register_handlers(bot: Bot):
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
 
         await message.answer(
-            f"⏳ Собираю статистику для {target_username} за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
+            f"⏳ Собираю статистику для {target_username} за {period_name} "
+            f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
 
         try:
             user_token = get_token_from_cache(target_username)
@@ -1027,7 +1111,8 @@ def register_handlers(bot: Bot):
         user_token = get_token_from_cache(user)
         if not user_token:
             await message.answer(
-                f"Для статистики за периоды нужен токен Lichess для ника {user}. Нажмите «🔑 Мой токен Lichess» в главном меню.",
+                f"Для статистики за периоды нужен токен Lichess для ника {user}. "
+                f"Нажмите «🔑 Мой токен Lichess» в главном меню.",
                 keyboard=get_periods_keyboard())
             return
 
@@ -1035,7 +1120,8 @@ def register_handlers(bot: Bot):
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
 
         await message.answer(
-            f"⏳ Собираю статистику за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
+            f"⏳ Собираю статистику за {period_name} "
+            f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})...")
 
         try:
             puzzles_data = await fetch_lichess_ndjson(
@@ -1085,11 +1171,13 @@ def register_handlers(bot: Bot):
 
             if puzzles_solved == 0 and tourn_count == 0:
                 await message.answer(
-                    f"За {period_name.lower()} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}) у вас нет активности.",
+                    f"За {period_name.lower()} "
+                    f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}) у вас нет активности.",
                     keyboard=get_periods_keyboard())
                 return
 
-            text = f"📊 Статистика за {period_name} ({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n"
+            text = (f"📊 Статистика за {period_name} "
+                    f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})\n\n")
 
             if puzzles_solved > 0:
                 text += f"🧩 Задачи:\n"
@@ -1185,7 +1273,8 @@ def register_handlers(bot: Bot):
             data = await fetch_lichess_json("https://lichess.org/api/puzzle/daily")
             rating = data.get('puzzle', {}).get('rating', '?')
             themes = ", ".join(data.get('puzzle', {}).get('themes', []))
-            text = f"🎯 Ежедневная задача Lichess\n\n📈 Рейтинг задачи: {rating}\n🏷️ Темы: {themes}\n\nРешить: https://lichess.org/training/daily"
+            text = (f"🎯 Ежедневная задача Lichess\n\n📈 Рейтинг задачи: {rating}\n"
+                    f"🏷️ Темы: {themes}\n\nРешить: https://lichess.org/training/daily")
             await message.answer(text, keyboard=get_back_to_main_keyboard())
         except Exception as e:
             await message.answer(f"⚠️ Ошибка загрузки задачи: {e}", keyboard=get_back_to_main_keyboard())
@@ -1292,7 +1381,9 @@ def register_handlers(bot: Bot):
 
         if status == 10:
             await message.answer(
-                f"📅 Турнир ещё не начался!\n\nДата: {date_str}\nУчастников: {players}\nСсылка: https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
+                f"📅 Турнир ещё не начался!\n\nДата: {date_str}\nУчастников: {players}\n"
+                f"Ссылка: https://lichess.org/"
+                f"{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
                 keyboard=back_kb)
             return
 
@@ -1304,7 +1395,8 @@ def register_handlers(bot: Bot):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 await message.answer(
-                    f"⚠️ Результаты недоступны.\nСсылка: https://lichess.org/{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
+                    f"⚠️ Результаты недоступны.\nСсылка: https://lichess.org/"
+                    f"{'tournament' if t_format == 'tournament' else 'swiss'}/{tid}",
                     keyboard=back_kb)
             else:
                 await message.answer(f"⚠️ Ошибка загрузки: {e}", keyboard=back_kb)
@@ -1349,22 +1441,17 @@ def register_handlers(bot: Bot):
         if message.payload:
             return
 
-        print(f"DEBUG: Получено сообщение '{text}' от {message.from_id}")
-        print(f"DEBUG: В waiting_for_code? {message.from_id in waiting_for_code}")
-
-        # --- 1. ПРОВЕРКА СЕКРЕТНОГО КОДА (самая первая) ---
+        # --- 1. СЕКРЕТНЫЙ КОД ---
         if message.from_id in waiting_for_code:
             if text.strip().lower() == SECRET_CODE.lower():
                 waiting_for_code.discard(message.from_id)
                 waiting_for_nick.add(message.from_id)
-                print(f"DEBUG: Код верный, переводим в waiting_for_nick")
                 await message.answer("✅ Код верный! Отлично.\n\nТеперь отправьте ваш ник на Lichess для привязки:")
             else:
-                print(f"DEBUG: Код неверный: '{text.strip()}' != '{SECRET_CODE}'")
                 await message.answer("❌ Неверный код доступа. Попробуйте еще раз или напишите /start для отмены.")
-            return  # <--- ОЧЕНЬ ВАЖНО! Останавливаем функцию, чтобы не проваливаться дальше
+            return
 
-        # --- 2. ПРОВЕРКА ТОКЕНА ---
+        # --- 2. ТОКЕН ---
         if message.from_id in waiting_for_token:
             token = text.strip()
             if not token.startswith("lip_"):
@@ -1377,16 +1464,18 @@ def register_handlers(bot: Bot):
             is_valid = await check_token_valid(token, user)
             if not is_valid:
                 await message.answer(
-                    f"❌ Токен недействителен или не принадлежит аккаунту {user}. Попробуйте другой токен или напишите /start для отмены.")
+                    f"❌ Токен недействителен или не принадлежит аккаунту {user}. "
+                    f"Попробуйте другой токен или напишите /start для отмены.")
                 return
 
             save_user_token(message.from_id, token)
             waiting_for_token.discard(message.from_id)
-            await message.answer(f"✅ Токен успешно привязан! Теперь статистика задач будет доступна в полном объеме.",
-                                 keyboard=get_main_keyboard())
+            await message.answer(
+                f"✅ Токен успешно привязан! Теперь статистика задач будет доступна в полном объеме.",
+                keyboard=get_main_keyboard())
             return
 
-        # --- 3. ПРОВЕРКА НИКА (привязка) ---
+        # --- 3. СМЕНА / ПРИВЯЗКА НИКА ---
         if message.from_id in waiting_for_nick:
             username = text.strip()
             if not username or len(username) > 30 or " " in username:
@@ -1399,17 +1488,32 @@ def register_handlers(bot: Bot):
                 await message.answer(f"❌ Игрок {username} не найден на Lichess.\nПопробуйте другой ник:")
                 return
 
-            
-
+            old_username = get_user_lichess(message.from_id)
             old_token = get_user_token(message.from_id)
             save_user(message.from_id, username)
             waiting_for_nick.discard(message.from_id)
 
+            # FIX: чистим кэш таблицы и старую запись токена при смене ника
+            if old_username and old_username.lower() != username.lower():
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("DELETE FROM token_cache WHERE username=?", (old_username.lower(),))
+                conn.commit()
+                conn.close()
+                table_cache.clear()
+
             if old_token:
                 is_valid_for_new_nick = await check_token_valid(old_token, username)
                 if not is_valid_for_new_nick:
+                    # Токен принадлежал старому нику — отвязываем
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
+                    conn.commit()
+                    conn.close()
+                    table_cache.clear()
                     await message.answer(
-                        f"✅ Успешно! Вы привязаны как {username}.\n",
+                        f"✅ Успешно! Вы привязаны как {username}.\n"
+                        f"⚠️ Старый токен не подходит к новому нику и был отвязан. "
+                        f"Привяжите новый через «🔑 Мой токен Lichess».",
                         keyboard=get_main_keyboard())
                     return
                 else:
@@ -1421,7 +1525,7 @@ def register_handlers(bot: Bot):
             await message.answer(f"✅ Успешно! Вы привязаны как {username}.", keyboard=get_main_keyboard())
             return
 
-        # --- 4. ПРОВЕРКА НИКА УЧАСТНИКА (для админов) ---
+        # --- 4. НИК УЧАСТНИКА (ДЛЯ РУКОВОДИТЕЛЕЙ) ---
         if message.from_id in waiting_for_member_nick:
             target_username = text.strip()
             if not target_username or len(target_username) > 30 or " " in target_username:
@@ -1440,7 +1544,7 @@ def register_handlers(bot: Bot):
                                  keyboard=get_member_period_keyboard())
             return
 
-        # --- 5. ФОЛБЭК (если ничего не подошло) ---
+        # --- 5. ФОЛБЭК ---
         await message.answer("Пожалуйста, пользуйтесь кнопками в меню ниже, или напишите 'Начать'.",
                              keyboard=get_main_keyboard())
 
