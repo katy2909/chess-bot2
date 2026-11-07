@@ -60,10 +60,21 @@ UNDER_PRESSURE_PHOTO = "under_pressure.png"
 # =====================================================================
 # BotHost сохраняет файлы только в папке /app/data.
 # Если папки нет (локальный запуск), создается папка "data" рядом с main.py
-data_dir = Path(os.environ.get("DATA_DIR", "data"))
-data_dir.mkdir(parents=True, exist_ok=True)
+from pathlib import Path
+import os
 
-DB_PATH = data_dir / "bot.db"
+# Если мы на сервере BotHost, жестко используем /app/data (там данные не удаляются)
+if os.name != 'nt':
+    data_dir = Path("/app/data")
+else:
+    # Если запускаем локально на Windows
+    data_dir = Path("data")
+
+data_dir.mkdir(parents=True, exist_ok=True)
+DB_PATH = str(data_dir / "bot.db")
+
+# Этот принт поможет нам увидеть путь в логах
+print(f"=== БАЗА ДАННЫХ БУДЕТ СОЗДАНА ПО ПУТИ: {DB_PATH} ===")
 
 # =====================================================================
 # ПЕРЕМЕННЫЕ СОСТОЯНИЯ
