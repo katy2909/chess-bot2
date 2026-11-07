@@ -346,12 +346,12 @@ async def fetch_member_data(client, username, start_date, end_date):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     async def safe_get(url, req_headers=None):
-        for attempt in range(5):
+        for attempt in range(3):  # 3 попытки
             try:
                 resp = await client.get(url, headers=req_headers)
                 if resp.status_code == 429:
-                    print(f"!!! ЛИМИТ ДЛЯ {username}, ЖДЕМ 10 СЕК...")
-                    await asyncio.sleep(10)
+                    print(f"!!! ЛИМИТ ДЛЯ {username}, ЖДЕМ 5 СЕК...")
+                    await asyncio.sleep(5)
                     continue
                 if resp.status_code == 404:
                     return resp
@@ -359,7 +359,7 @@ async def fetch_member_data(client, username, start_date, end_date):
                     return resp
             except Exception:
                 pass
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
         raise Exception(f"Не удалось получить данные для {username}")
 
     async def get_arena():
@@ -452,24 +452,32 @@ async def fetch_and_save_table_data(period_type):
         members = [{"id": u} for u in token_usernames]
         new_results = []
 
-        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-            sem = asyncio.Semaphore(5)
+        async def fetch_all():
+            async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+                # УВЕЛИЧЕНО ДО 15 ЧЕЛОВЕК
+                sem = asyncio.Semaphore(15)
 
-            async def bounded_fetch(m):
-                async with sem:
-                    username = m.get('id')
-                    if not username: return None
-                    try:
-                        return await fetch_member_data(client, username, start_date, end_date)
-                    except Exception as e:
-                        print(str(e))
-                        return None
+                async def bounded_fetch(m):
+                    async with sem:
+                        username = m.get('id')
+                        if not username: return None
+                        try:
+                            return await fetch_member_data(client, username, start_date, end_date)
+                        except Exception as e:
+                            print(str(e))
+                            return None
 
-            for i in range(0, len(members), 5):
-                batch = members[i:i + 5]
-                batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
-                new_results.extend(batch_results)
-                await asyncio.sleep(2)
+                for i in range(0, len(members), 15):
+                    batch = members[i:i + 15]
+                    batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
+                    new_results.extend(batch_results)
+                    await asyncio.sleep(1)
+
+        # ТАЙМАУТ 90 СЕКУНД
+        try:
+            await asyncio.wait_for(fetch_all(), timeout=90.0)
+        except asyncio.TimeoutError:
+            print("=== ТАЙМАУТ! Lichess слишком долго не отвечает. Сохраняем то, что есть. ===")
 
         final_rows = []
         for m in members:
@@ -481,7 +489,6 @@ async def fetch_and_save_table_data(period_type):
             else:
                 if username.lower() in old_rows_dict:
                     final_rows.append(old_rows_dict[username.lower()])
-                    print(f"=== ОШИБКА API: {username} оставлены старые данные ===")
                 else:
                     final_rows.append((username, 0, 0, 0))
 
@@ -559,33 +566,26 @@ async def fetch_and_save_club_data():
 
 
 async def background_updater_loop():
-    # Ждем 15 секунд при запуске, чтобы бот прогрузился
     await asyncio.sleep(15)
 
     while True:
-        # Определяем московское время (UTC+3)
         msk_tz = timezone(timedelta(hours=3))
         now_msk = datetime.now(msk_tz)
 
-        # Вычисляем, сколько секунд осталось до ближайших 00:00 по МСК
         next_midnight = (now_msk + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         seconds_until_midnight = (next_midnight - now_msk).total_seconds()
 
         print(f"=== СЛЕДУЮЩЕЕ ОБНОВЛЕНИЕ ЗАПЛАНИРОВАНО НА {next_midnight.strftime('%d.%m.%Y %H:%M')} МСК ===")
 
-        # Спим до полуночи
         await asyncio.sleep(seconds_until_midnight)
 
-        # --- НАСТУПИЛО 00:00 МСК ---
         print("=== 00:00 МСК: СБРОС КЭШЕЙ И ЗАПУСК ОБНОВЛЕНИЯ ===")
 
-        # 1. Сбрасываем кэши задачи дня, периодов и турниров
         daily_puzzle_cache["data"] = None
         daily_puzzle_cache["timestamp"] = 0
         api_cache.clear()
         tournaments_cache["data"] = []
 
-        # 2. Удаляем старые файлы кэша таблицы и клуба, чтобы они собрались заново
         for file_path in [CACHE_FILE, CLUB_CACHE_FILE]:
             if os.path.exists(file_path):
                 try:
@@ -596,7 +596,6 @@ async def background_updater_loop():
         table_cache.clear()
         club_stats_cache["text"] = ""
 
-        # 3. Запускаем сбор тяжелых данных
         await fetch_and_save_table_data("autumn")
         await asyncio.sleep(5)
         await fetch_and_save_table_data("spring")
@@ -607,7 +606,7 @@ async def background_updater_loop():
 
 
 # =====================================================================
-# КЛАВИАТУРЫ (без изменений)
+# КЛАВИАТУРЫ
 # =====================================================================
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
