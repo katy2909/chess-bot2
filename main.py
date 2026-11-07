@@ -53,7 +53,7 @@ TEAM_ID = "pHf9ZSwg"
 LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
 CHAMP_KEYWORDS = ["PolyStation"]
 
-# Файл фото чемпионата
+# Файл фото чемпионата (как на вашем скриншоте)
 UNDER_PRESSURE_PHOTO = "under_pressure.png"
 
 # =====================================================================
@@ -66,8 +66,10 @@ else:  # Если запущено локально на Windows
 
 data_dir.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(data_dir / "bot.db")
+CACHE_FILE = str(data_dir / "table_cache.json")
 
 print(f"=== БАЗА ДАННЫХ ИНИЦИАЛИЗИРУЕТСЯ ПО ПУТИ: {DB_PATH} ===")
+print(f"=== ФАЙЛ КЭША ТАБЛИЦЫ: {CACHE_FILE} ===")
 
 # =====================================================================
 # ПЕРЕМЕННЫЕ СОСТОЯНИЯ
@@ -260,6 +262,9 @@ async def get_all_team_tournaments():
 
 # --- ЗАГРУЗКА ФОТО В VK ---
 async def upload_photo_to_vk(api, peer_id, file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Файл {file_path} не найден")
+
     server = await api.photos.get_messages_upload_server(peer_id=peer_id)
     upload_url = server.upload_url
 
@@ -301,10 +306,175 @@ async def is_club_leader(username):
 
 
 # =====================================================================
+# ФОНОВОЕ ОБНОВЛЕНИЕ И СБОР ДАННЫХ ДЛЯ ТАБЛИЦЫ
+# =====================================================================
+async def fetch_member_data(client, username, start_date, end_date):
+    token = get_token_from_cache(username)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    async def safe_get(url, req_headers=None):
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, headers=req_headers)
+                if resp.status_code == 429:
+                    await asyncio.sleep(2)
+                    continue
+                if resp.status_code == 200:
+                    return resp
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        return None
+
+    async def get_arena():
+        count, wins = 0, 0
+        resp = await safe_get(f"https://lichess.org/api/user/{username.lower()}/tournament/played", headers)
+        if resp:
+            for line in resp.text.strip().split('\n'):
+                if line.strip():
+                    try:
+                        t = json.loads(line)
+                        starts_at = t.get('tournament', {}).get('startsAt', 0)
+                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                        if start_date <= t_date <= end_date:
+                            count += 1
+                            if t.get('player', {}).get('rank') == 1: wins += 1
+                    except Exception:
+                        continue
+        return count, wins
+
+    async def get_swiss():
+        count, wins = 0, 0
+        resp = await safe_get(f"https://lichess.org/api/user/{username.lower()}/swiss/played", headers)
+        if resp:
+            for line in resp.text.strip().split('\n'):
+                if line.strip():
+                    try:
+                        t = json.loads(line)
+                        starts_at = t.get('tournament', {}).get('startsAt', 0)
+                        t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                        if start_date <= t_date <= end_date:
+                            count += 1
+                            if t.get('player', {}).get('rank') == 1: wins += 1
+                    except Exception:
+                        continue
+        return count, wins
+
+    async def get_puzzles():
+        count = 0
+        if token:
+            resp = await safe_get("https://lichess.org/api/puzzle/activity", headers)
+            if resp:
+                for line in resp.text.strip().split('\n'):
+                    if line.strip():
+                        try:
+                            entry = json.loads(line)
+                            event_ts = entry.get("date", 0)
+                            event_date = datetime.fromtimestamp(event_ts / 1000).date()
+                            if start_date <= event_date <= end_date: count += 1
+                        except Exception:
+                            continue
+        return count
+
+    results = await asyncio.gather(get_arena(), get_swiss(), get_puzzles(), return_exceptions=True)
+
+    arena_c, arena_w = results[0] if isinstance(results[0], tuple) else (0, 0)
+    swiss_c, swiss_w = results[1] if isinstance(results[1], tuple) else (0, 0)
+    puzzles_c = results[2] if isinstance(results[2], int) else 0
+
+    return (username, puzzles_c, arena_c + swiss_c, arena_w + swiss_w)
+
+
+async def fetch_and_save_table_data(period_type):
+    start_date, end_date = get_period_dates(period_type)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT username FROM token_cache")
+        token_usernames = [row[0] for row in c.fetchall()]
+        c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
+        known_names = {row[0].lower(): row[0] for row in c.fetchall()}
+        conn.close()
+
+        token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
+        if not token_usernames:
+            return False
+
+        members = [{"id": u} for u in token_usernames]
+        rows = []
+
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            sem = asyncio.Semaphore(15)
+
+            async def bounded_fetch(m):
+                async with sem:
+                    username = m.get('id')
+                    if not username: return None
+                    try:
+                        return await fetch_member_data(client, username, start_date, end_date)
+                    except Exception:
+                        return (username, 0, 0, 0)
+
+            all_results = []
+            for i in range(0, len(members), 15):
+                batch = members[i:i + 15]
+                batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
+                all_results.extend(batch_results)
+                await asyncio.sleep(0.5)
+
+        for res in all_results:
+            if res: rows.append((res[0], res[1], res[2], res[3]))
+
+        if rows:
+            rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
+
+            cached_data = {}
+            if os.path.exists(CACHE_FILE):
+                try:
+                    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                        cached_data = json.load(f)
+                except Exception:
+                    pass
+
+            cached_data[period_type] = {"data": rows, "timestamp": time.time()}
+            table_cache[period_type] = cached_data[period_type]
+
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cached_data, f, ensure_ascii=False)
+
+            print(f"=== ФОНОВОЕ ОБНОВЛЕНИЕ: Таблица за {period_type} успешно обновлена ({len(rows)} чел.) ===")
+            return True
+    except Exception as e:
+        print(f"!!! ОШИБКА ФОНОВОГО ОБНОВЛЕНИЯ: {e}")
+    return False
+
+
+async def background_updater_loop():
+    """Бесконечный цикл, который обновляет таблицу каждые 24 часа."""
+    await asyncio.sleep(15)
+
+    while True:
+        print("=== ЗАПУСК АВТОМАТИЧЕСКОГО ОБНОВЛЕНИЯ ТАБЛИЦЫ ===")
+        await fetch_and_save_table_data("autumn")
+        await asyncio.sleep(5)
+        await fetch_and_save_table_data("spring")
+
+        print("=== АВТООБНОВЛЕНИЕ ЗАВЕРШЕНО. СЛЕДУЮЩЕЕ ЧЕРЕЗ 24 ЧАСА ===")
+        await asyncio.sleep(86400)
+
+
+# =====================================================================
 # КЛАВИАТУРЫ
 # =====================================================================
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
+
+    # 👇 Кнопка чемпионата теперь самая первая
+    keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
+                 color=KeyboardButtonColor.POSITIVE)
+    keyboard.row()
+
     keyboard.add(Text("👤 Статистика игрока", payload={"cmd": "menu_player"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🧩 Статистика задач", payload={"cmd": "menu_puzzles"}), color=KeyboardButtonColor.PRIMARY)
@@ -316,13 +486,12 @@ def get_main_keyboard():
     keyboard.add(Text("📊 Статистика для руководителей клуба", payload={"cmd": "leaders_menu"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
-    keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
-                 color=KeyboardButtonColor.PRIMARY)
-    keyboard.row()
-    keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
+
+    keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.POSITIVE)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.row()
     keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
+
     return keyboard.get_json()
 
 
@@ -469,7 +638,9 @@ def pluralize(n, forms):
 
 
 async def send_table_page(target, period_type, page, is_edit=False):
-    rows = table_cache.get(period_type, [])
+    cache_entry = table_cache.get(period_type, {})
+    rows = cache_entry.get("data", [])
+
     per_page = 20
     start_idx = page * per_page
     end_idx = start_idx + per_page
@@ -492,7 +663,6 @@ async def send_table_page(target, period_type, page, is_edit=False):
     text += f"Рейтинг участников · стр. {page + 1}/{total_pages}\n\n"
 
     if page_rows:
-        # Теперь распаковываем 4 значения: username, puzzles, tourns, wins
         for i, (username, puzzles, tourns, wins) in enumerate(page_rows, start_idx + 1):
             total = puzzles + tourns
 
@@ -503,9 +673,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
 
             prefix = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
 
-            # Выводим основную строку с баллами
             text += f"{prefix} {username} — {total} {ball_word}\n"
-            # Выводим детальную статистику (задачи, турниры, победы)
             text += f"\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word} · 🥇 {wins} {win_word}\n"
     else:
         text += "На этой странице нет участников.\n"
@@ -520,6 +688,11 @@ async def send_table_page(target, period_type, page, is_edit=False):
         f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
 
     keyboard = Keyboard(one_time=False, inline=False)
+
+    keyboard.add(Text("🔄 Обновить данные", payload={"cmd": "table_update", "type": period_type}),
+                 color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
+
     nav_buttons = []
     if page > 0:
         nav_buttons.append(Text("⬅️ Назад", payload={"cmd": "table_page", "type": period_type, "page": page - 1}))
@@ -648,138 +821,67 @@ def register_handlers(bot: Bot):
         waiting_for_table.add(message.from_id)
         await message.answer("Выберите период для таблицы участников:", keyboard=get_table_period_keyboard())
 
-    async def fetch_member_data(client, username, start_date, end_date):
-        tourn_count = 0
-        tourn_wins = 0
-        puzzles_solved = 0
-
-        # 1. Арены (убрали ?max=1000)
-        try:
-            url_arena = f"https://lichess.org/api/user/{username.lower()}/tournament/played"
-            resp = await client.get(url_arena)
-            if resp.status_code == 200:
-                for line in resp.text.strip().split('\n'):
-                    if line.strip():
-                        try:
-                            t = json.loads(line)
-                            starts_at = t.get('tournament', {}).get('startsAt', 0)
-                            t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                            if start_date <= t_date <= end_date:
-                                tourn_count += 1
-                                if t.get('player', {}).get('rank') == 1:
-                                    tourn_wins += 1
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-        # 2. Швейцарки (убрали ?max=1000)
-        try:
-            url_swiss = f"https://lichess.org/api/user/{username.lower()}/swiss/played"
-            resp = await client.get(url_swiss)
-            if resp.status_code == 200:
-                for line in resp.text.strip().split('\n'):
-                    if line.strip():
-                        try:
-                            t = json.loads(line)
-                            starts_at = t.get('tournament', {}).get('startsAt', 0)
-                            t_date = datetime.fromtimestamp(starts_at / 1000).date()
-                            if start_date <= t_date <= end_date:
-                                tourn_count += 1
-                                if t.get('player', {}).get('rank') == 1:
-                                    tourn_wins += 1
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-        # 3. Задачи (убрали ?max=1000, улучшили обработку ошибок)
-        token = get_token_from_cache(username)
-        if token:
-            try:
-                url_p = "https://lichess.org/api/puzzle/activity"
-                headers_p = {"Authorization": f"Bearer {token}"}
-                resp = await client.get(url_p, headers=headers_p)
-                if resp.status_code == 200:
-                    for line in resp.text.strip().split('\n'):
-                        if line.strip():
-                            try:
-                                entry = json.loads(line)
-                                event_ts = entry.get("date", 0)
-                                event_date = datetime.fromtimestamp(event_ts / 1000).date()
-                                if start_date <= event_date <= end_date:
-                                    puzzles_solved += 1
-                            except Exception:
-                                continue
-            except Exception:
-                pass
-
-        return (username, puzzles_solved, tourn_count, tourn_wins)
-
     @bot.on.message(payload_contains={"cmd": "table_period"})
     async def table_period_handler(message: Message):
         payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
         period_type = payload_data.get("type", "autumn")
-
-        start_date, end_date = get_period_dates(period_type)
         period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
 
         if period_type in table_cache:
             await send_table_page(message, period_type, 0)
             return
 
-        await message.answer(
-            f"⏳ Собираю таблицу участников за {period_name}.\nВ таблицу попадают только участники, привязавшие свой токен Lichess. Подождите...")
+        cached_data = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+            except Exception:
+                pass
 
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("SELECT username FROM token_cache")
-            token_usernames = [row[0] for row in c.fetchall()]
-            c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
-            known_names = {row[0].lower(): row[0] for row in c.fetchall()}
-            conn.close()
-
-            # Оставляем ВСЕХ (включая руководителей)
-            token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
-
-            if not token_usernames:
-                await message.answer(
-                    "Пока никто из участников не добавил токен Lichess.\nТаблица появится, как только участники привяжут свой токен через «🔑 Мой токен Lichess».",
-                    keyboard=get_table_period_keyboard())
-                return
-
-            members = [{"id": u} for u in token_usernames]
-            rows = []
-
-            async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
-                sem = asyncio.Semaphore(5)
-
-                async def bounded_fetch(m):
-                    async with sem:
-                        username = m.get('id')
-                        if not username: return None
-                        try:
-                            return await fetch_member_data(client, username, start_date, end_date)
-                        except Exception:
-                            return (username, 0, 0, 0)
-
-                results = await asyncio.gather(*(bounded_fetch(m) for m in members))
-
-            for res in results:
-                if res: rows.append((res[0], res[1], res[2], res[3]))
-
-            if not rows:
-                await message.answer("Не удалось собрать данные ни по одному участнику.")
-                return
-
-            # Сортируем: сначала по сумме (задачи+турниры), потом по победам, потом по алфавиту
-            rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
-            table_cache[period_type] = rows
+        if period_type in cached_data:
+            table_cache[period_type] = cached_data[period_type]
             await send_table_page(message, period_type, 0)
+            return
 
-        except Exception as e:
-            await message.answer(f"⚠️ Ошибка при сборе таблицы: {e}", keyboard=get_table_period_keyboard())
+        await message.answer(
+            f"⏳ База только создается. Собираю таблицу за {period_name} в первый раз. Это займет около минуты...")
+        success = await fetch_and_save_table_data(period_type)
+
+        if success:
+            await send_table_page(message, period_type, 0)
+        else:
+            await message.answer("⚠️ Не удалось собрать данные (возможно, в базе пока нет участников с токенами).",
+                                 keyboard=get_table_period_keyboard())
+
+    @bot.on.message(payload_contains={"cmd": "table_update"})
+    async def table_update_handler(message: Message):
+        payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
+        period_type = payload_data.get("type", "autumn")
+        period_name = "Осенний период" if period_type == "autumn" else "Весенний период"
+
+        await message.answer(f"⏳ Принудительно обновляю таблицу за {period_name}. Пожалуйста, подождите...")
+
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                if period_type in cached_data:
+                    del cached_data[period_type]
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(cached_data, f, ensure_ascii=False)
+            except Exception:
+                pass
+
+        if period_type in table_cache:
+            del table_cache[period_type]
+
+        success = await fetch_and_save_table_data(period_type)
+
+        if success:
+            await send_table_page(message, period_type, 0)
+        else:
+            await message.answer("⚠️ Не удалось обновить данные.", keyboard=get_table_period_keyboard())
 
     @bot.on.message(payload_contains={"cmd": "table_page"})
     async def table_page_handler(message: Message):
@@ -1251,25 +1353,21 @@ def register_handlers(bot: Bot):
             save_user(message.from_id, username)
             waiting_for_nick.discard(message.from_id)
 
-            # Ищем в базе, есть ли уже сохраненный токен для этого ника
             cached_token = get_token_from_cache(username)
-
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
 
             if cached_token:
-                # Если токен найден, привязываем его к пользователю
                 c.execute("UPDATE users SET lichess_token=? WHERE vk_id=?", (cached_token, message.from_id))
                 conn.commit()
                 conn.close()
-                table_cache.clear()  # Сбрасываем кэш таблицы
+                table_cache.clear()
                 await message.answer(
                     f"✅ Успешно! Вы привязаны как {username}.\n"
                     f"🔑 В базе найден сохраненный токен для этого ника.",
                     keyboard=get_main_keyboard()
                 )
             else:
-                # Если токена нет, отвязываем старый токен у пользователя
                 c.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
                 conn.commit()
                 conn.close()
@@ -1314,6 +1412,10 @@ async def main():
     api = API(token=VK_TOKEN, http_client=http_client)
     bot = Bot(api=api)
     register_handlers(bot)
+
+    # Запускаем фоновое обновление таблицы
+    asyncio.create_task(background_updater_loop())
+
     await bot.run_polling()
 
 
