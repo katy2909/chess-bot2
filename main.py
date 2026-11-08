@@ -42,7 +42,7 @@ PayloadRule.check = _safe_payload_check
 os.environ["VKBOTTLE_SKIP_LOGGING_PRESET"] = "1"
 
 from vkbottle.bot import Bot, Message
-from vkbottle import Keyboard, Text, KeyboardButtonColor
+from vkbottle import Keyboard, Text, KeyboardButtonColor, DocMessagesUploader
 from vkbottle.http import SingleAiohttpClient
 from vkbottle.api import API
 
@@ -349,30 +349,15 @@ async def upload_photo_to_vk(api, peer_id, file_path):
     return f"photo{photo.owner_id}_{photo.id}"
 
 
+# ИСПРАВЛЕННАЯ ФУНКЦИЯ ЗАГРУЗКИ EXCEL
 async def upload_doc_to_vk(api, peer_id, file_path, title):
-    server = await api.docs.get_messages_upload_server(peer_id=peer_id)
-    upload_url = server.upload_url
-
-    with open(file_path, "rb") as f:
-        file_content = f.read()
-
-    form = aiohttp.FormData()
-    form.add_field(
-        "file",
-        file_content,
-        filename=os.path.basename(file_path),
-        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    uploader = DocMessagesUploader(api)
+    attachment = await uploader.upload(
+        file_source=file_path,
+        peer_id=peer_id,
+        title=title
     )
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(upload_url, data=form) as resp:
-            upload_data = await resp.json()
-
-    saved = await api.docs.save(file=upload_data["file"], title=title)
-    if hasattr(saved, "response"): saved = saved.response
-
-    doc = saved[0] if isinstance(saved, list) else saved
-    return f"doc{doc.owner_id}_{doc.id}"
+    return attachment
 
 
 # --- РАСЧЕТ ПЕРИОДОВ ---
@@ -551,8 +536,6 @@ async def fetch_and_save_table_data(period_type):
         for m in members:
             username = m["id"]
             new_res = next((r for r in new_results if r and r[0].lower() == username.lower()), None)
-
-            # Гарантируем, что фамилия будет пустой строкой, если её нет
             sname = (surname_map.get(username.lower()) or "").strip()
 
             if new_res:
@@ -718,11 +701,9 @@ def generate_excel_table(period_type):
         puzzles = r[1]
         tourns = r[2]
         wins = r[3]
-        # Здесь тоже гарантируем пустоту, если фамилии нет
         surname = (r[4] or "").strip() if len(r) > 4 else ""
         total = puzzles + tourns
 
-        # Если фамилии нет, в ячейке будет просто пусто
         ws.append([i, surname, username, puzzles, tourns, wins, total])
 
     for col in ws.columns:
@@ -975,11 +956,8 @@ async def send_table_page(target, period_type, page, is_edit=False):
             puzzles = r[1]
             tourns = r[2]
             wins = r[3]
-
-            # Берем фамилию. Если её нет, будет пустая строка.
             surname = (r[4] or "").strip() if len(r) > 4 else ""
 
-            # Если фамилия пустая, выводим только ник. Если есть - "Фамилия Ник"
             display_name = f"{surname} {username}".strip() if surname else username
 
             total = puzzles + tourns
