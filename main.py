@@ -53,7 +53,7 @@ SECRET_CODE = "chess-bot"
 VK_TOKEN = os.getenv("BOT_TOKEN")
 TEAM_ID = "pHf9ZSwg"
 
-LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM"]
+LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM", "Kate_pankov"]
 CHAMP_KEYWORDS = ["PolyStation"]
 
 UNDER_PRESSURE_PHOTO = "under_pressure.png"
@@ -108,15 +108,12 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (vk_id INTEGER PRIMARY KEY, lichess_username TEXT, lichess_token TEXT, surname TEXT)''')
+                 (vk_id INTEGER PRIMARY KEY, lichess_username TEXT, lichess_token TEXT)''')
+    # НОВАЯ ТАБЛИЦА ДЛЯ ФАМИЛИЙ (привязана к нику)
+    c.execute('''CREATE TABLE IF NOT EXISTS surnames
+                 (username TEXT PRIMARY KEY, surname TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS token_cache
                  (username TEXT PRIMARY KEY, token TEXT)''')
-    c.execute("PRAGMA table_info(users)")
-    columns = [info[1] for info in c.fetchall()]
-    if 'lichess_token' not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN lichess_token TEXT")
-    if 'surname' not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN surname TEXT")
     conn.commit()
     conn.close()
 
@@ -165,12 +162,16 @@ def save_user_token(vk_id, token):
 
 
 def save_user_surname(vk_id, surname):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET surname=? WHERE vk_id=?", (surname, vk_id))
-    conn.commit()
-    conn.close()
-    table_cache.clear()
+    # Теперь сохраняем фамилию в таблицу surnames, привязывая её к текущему нику
+    username = get_user_lichess(vk_id)
+    if username:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO surnames (username, surname) VALUES (?, ?)",
+                  (username.lower(), surname.strip()))
+        conn.commit()
+        conn.close()
+        table_cache.clear()
 
 
 def save_token_cache(username, token):
@@ -349,7 +350,6 @@ async def upload_photo_to_vk(api, peer_id, file_path):
     return f"photo{photo.owner_id}_{photo.id}"
 
 
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ ЗАГРУЗКИ EXCEL
 async def upload_doc_to_vk(api, peer_id, file_path, title):
     uploader = DocMessagesUploader(api)
     attachment = await uploader.upload(
@@ -467,15 +467,14 @@ async def fetch_and_save_table_data(period_type):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT lichess_username, surname FROM users WHERE lichess_username IS NOT NULL")
-        users_data = c.fetchall()
 
-        token_usernames = []
-        surname_map = {}
-        for uname, sname in users_data:
-            token_usernames.append(uname)
-            if sname:
-                surname_map[uname.lower()] = sname.strip()
+        # Получаем ники из users
+        c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
+        token_usernames = [row[0] for row in c.fetchall()]
+
+        # Получаем фамилии из новой таблицы
+        c.execute("SELECT username, surname FROM surnames")
+        surname_map = {row[0].lower(): row[1] for row in c.fetchall()}
 
         c.execute("SELECT username FROM token_cache")
         cache_usernames = [row[0] for row in c.fetchall()]
@@ -535,6 +534,8 @@ async def fetch_and_save_table_data(period_type):
         for m in members:
             username = m["id"]
             new_res = next((r for r in new_results if r and r[0].lower() == username.lower()), None)
+
+            # Теперь фамилия берется из surname_map (привязана к нику)
             sname = (surname_map.get(username.lower()) or "").strip()
 
             if new_res:
@@ -744,12 +745,13 @@ def get_main_keyboard():
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
 
+    keyboard.add(Text("📝 Добавить фамилию", payload={"cmd": "add_surname"}), color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
     keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.NEGATIVE)
     keyboard.row()
     keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
-    keyboard.add(Text("📝 Добавить фамилию", payload={"cmd": "add_surname"}), color=KeyboardButtonColor.SECONDARY)
-    keyboard.row()
+
     return keyboard.get_json()
 
 
@@ -1066,7 +1068,7 @@ def register_handlers(bot: Bot):
         waiting_for_surname.add(message.from_id)
 
         await message.answer(
-            "📝 Введите вашу фамилию (например, Иванов).\nОна будет отображаться в таблице участников перед ником.",
+            f"📝 Введите вашу фамилию для ника {user}.\nОна будет отображаться в таблице участников перед ником.",
             keyboard=Keyboard(one_time=True).get_json())
 
     @bot.on.message(payload_contains={"cmd": "leaders_menu"})
@@ -1676,8 +1678,11 @@ def register_handlers(bot: Bot):
 
             save_user_surname(message.from_id, surname)
             waiting_for_surname.discard(message.from_id)
-            await message.answer(f"✅ Фамилия '{surname}' успешно сохранена и будет отображаться в таблице!",
-                                 keyboard=get_main_keyboard())
+
+            user = get_user_lichess(message.from_id)
+            await message.answer(
+                f"✅ Фамилия '{surname}' успешно сохранена для ника {user} и будет отображаться в таблице!",
+                keyboard=get_main_keyboard())
             return
 
         if message.from_id in waiting_for_nick:
@@ -1721,8 +1726,9 @@ def register_handlers(bot: Bot):
 
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            # Ищем по таблице surnames
             c.execute(
-                "SELECT lichess_username, surname FROM users WHERE LOWER(lichess_username)=LOWER(?) OR LOWER(surname)=LOWER(?)",
+                "SELECT username, surname FROM surnames WHERE LOWER(username)=LOWER(?) OR LOWER(surname)=LOWER(?)",
                 (query, query))
             row = c.fetchone()
             conn.close()
