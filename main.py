@@ -899,6 +899,10 @@ async def send_table_page(target, period_type, page, is_edit=False):
 # РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
 # =====================================================================
 def register_handlers(bot: Bot):
+    @bot.on.message(text="!version")
+    async def version_handler(message: Message):
+        await message.answer("✅ Код обновлен! Версия с [СБОР] активна.")
+        
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
