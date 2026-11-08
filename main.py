@@ -468,13 +468,13 @@ async def fetch_and_save_table_data(period_type):
         new_results = []
         processed_count = 0
 
-        print(f"=== НАЧАЛО СБОРА ТАБЛИЦЫ (Всего участников: {len(members)}) ===")
+        print(f"=== [СБОР ТАБЛИЦЫ] НАЧАЛО. Всего участников: {len(members)} ===", flush=True)
 
         async def fetch_all():
             nonlocal processed_count
-            async with httpx.AsyncClient(verify=False) as client:
-                # СТАВИМ БАТЧ ПО 3 ЧЕЛОВЕКА, ЧТОБЫ LICHESS НЕ ОТКЛОНЯЛ
-                sem = asyncio.Semaphore(3)
+            # Жесткий таймаут на все запросы внутри сессии (10 секунд)
+            async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                sem = asyncio.Semaphore(5)  # По 5 человек за раз
 
                 async def bounded_fetch(m):
                     nonlocal processed_count
@@ -484,26 +484,26 @@ async def fetch_and_save_table_data(period_type):
                         try:
                             res = await fetch_member_data(client, username, start_date, end_date)
                             processed_count += 1
-                            print(f"=== Собрано {processed_count}/{len(members)}: {username} ===")
+                            print(f"=== [СБОР] {processed_count}/{len(members)}: {username} ===", flush=True)
                             return res
                         except Exception as e:
-                            print(str(e))
+                            processed_count += 1
+                            print(f"=== [ОШИБКА] {processed_count}/{len(members)}: {username} ({e}) ===", flush=True)
                             return None
 
-                for i in range(0, len(members), 3):
-                    batch = members[i:i + 3]
+                for i in range(0, len(members), 5):
+                    batch = members[i:i + 5]
                     batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
                     new_results.extend(batch_results)
-                    await asyncio.sleep(2)  # Отдыхаем 2 секунды
+                    await asyncio.sleep(1.0)
 
-        # УБРАЛИ ЖЕСТКИЙ ТАЙМ-АУТ. ПУСТЬ РАБОТАЕТ, СКОЛЬКО НУЖНО.
-        await fetch_all()
+        # Жесткий таймаут на весь процесс (максимум 3 минуты)
+        try:
+            await asyncio.wait_for(fetch_all(), timeout=180.0)
+        except asyncio.TimeoutError:
+            print("!!! [СБОР] ТАЙМАУТ! Lichess не ответил вовремя. Сохраняем что есть.", flush=True)
 
-        print("=== СБОР ЗАВЕРШЕН. ОБРАБОТКА РЕЗУЛЬТАТОВ... ===")
-
-        if not any(new_results):
-            print("=== ПОЛНЫЙ ПРОВАЛ СБОРА. НЕ СОХРАНЯЕМ НУЛИ, ОСТАВЛЯЕМ СТАРЫЕ ДАННЫЕ ===")
-            return False
+        print("=== [СБОР] ЗАВЕРШЕН. ОБРАБОТКА РЕЗУЛЬТАТОВ... ===", flush=True)
 
         final_rows = []
         for m in members:
@@ -534,10 +534,10 @@ async def fetch_and_save_table_data(period_type):
 
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cached_data, f, ensure_ascii=False)
-            print(f"=== ТАБЛИЦА {period_type} УСПЕШНО ОБНОВЛЕНА ===")
+            print(f"=== [СБОР] ТАБЛИЦА {period_type} УСПЕШНО СОХРАНЕНА ===", flush=True)
             return True
     except Exception as e:
-        print(f"!!! ГЛОБАЛЬНАЯ ОШИБКА ТАБЛИЦЫ: {e}")
+        print(f"!!! [СБОР] ГЛОБАЛЬНАЯ ОШИБКА: {e}", flush=True)
     return False
 
 
