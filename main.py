@@ -468,13 +468,12 @@ async def fetch_and_save_table_data(period_type):
         new_results = []
         processed_count = 0
 
-        print(f"=== [СБОР ТАБЛИЦЫ] НАЧАЛО. Всего участников: {len(members)} ===", flush=True)
+        print(f"\n=== [СБОР] НАЧАЛО. Всего участников: {len(members)} ===\n", flush=True)
 
         async def fetch_all():
             nonlocal processed_count
-            # Жесткий таймаут на все запросы внутри сессии (10 секунд)
-            async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
-                sem = asyncio.Semaphore(5)  # По 5 человек за раз
+            async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+                sem = asyncio.Semaphore(3)  # Уменьшили до 3, чтобы не злить Lichess
 
                 async def bounded_fetch(m):
                     nonlocal processed_count
@@ -488,22 +487,19 @@ async def fetch_and_save_table_data(period_type):
                             return res
                         except Exception as e:
                             processed_count += 1
-                            print(f"=== [ОШИБКА] {processed_count}/{len(members)}: {username} ({e}) ===", flush=True)
+                            print(f"=== [ОШИБКА] {processed_count}/{len(members)}: {username} ===", flush=True)
                             return None
 
-                for i in range(0, len(members), 5):
-                    batch = members[i:i + 5]
+                for i in range(0, len(members), 3):
+                    batch = members[i:i + 3]
                     batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
                     new_results.extend(batch_results)
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(2)  # Отдыхаем 2 сек
 
-        # Жесткий таймаут на весь процесс (максимум 3 минуты)
-        try:
-            await asyncio.wait_for(fetch_all(), timeout=180.0)
-        except asyncio.TimeoutError:
-            print("!!! [СБОР] ТАЙМАУТ! Lichess не ответил вовремя. Сохраняем что есть.", flush=True)
+        # УБРАЛИ ASYNCIO.WAIT_FOR (Теперь нет лимита в 3 минуты)
+        await fetch_all()
 
-        print("=== [СБОР] ЗАВЕРШЕН. ОБРАБОТКА РЕЗУЛЬТАТОВ... ===", flush=True)
+        print("\n=== [СБОР] ЗАВЕРШЕН. ОБРАБОТКА РЕЗУЛЬТАТОВ... ===\n", flush=True)
 
         final_rows = []
         for m in members:
@@ -534,10 +530,10 @@ async def fetch_and_save_table_data(period_type):
 
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cached_data, f, ensure_ascii=False)
-            print(f"=== [СБОР] ТАБЛИЦА {period_type} УСПЕШНО СОХРАНЕНА ===", flush=True)
+            print(f"\n=== [СБОР] ТАБЛИЦА {period_type} УСПЕШНО СОХРАНЕНА ===\n", flush=True)
             return True
     except Exception as e:
-        print(f"!!! [СБОР] ГЛОБАЛЬНАЯ ОШИБКА: {e}", flush=True)
+        print(f"\n!!! [СБОР] ГЛОБАЛЬНАЯ ОШИБКА: {e}\n", flush=True)
     return False
 
 
@@ -902,7 +898,7 @@ def register_handlers(bot: Bot):
     @bot.on.message(text="!version")
     async def version_handler(message: Message):
         await message.answer("✅ Код обновлен! Версия с [СБОР] активна.")
-        
+
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
