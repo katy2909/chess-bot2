@@ -6,6 +6,9 @@ import re
 import time
 import aiohttp
 import os
+import sys
+import openpyxl
+from openpyxl.styles import Font, Alignment
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from aiohttp import TCPConnector
@@ -78,6 +81,7 @@ waiting_for_nick = set()
 waiting_for_token = set()
 waiting_for_member_nick = set()
 waiting_for_table = set()
+waiting_for_surname = set()
 pending_member_target = {}
 
 # Глобальные кэши
@@ -104,13 +108,15 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (vk_id INTEGER PRIMARY KEY, lichess_username TEXT, lichess_token TEXT)''')
+                 (vk_id INTEGER PRIMARY KEY, lichess_username TEXT, lichess_token TEXT, surname TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS token_cache
                  (username TEXT PRIMARY KEY, token TEXT)''')
     c.execute("PRAGMA table_info(users)")
     columns = [info[1] for info in c.fetchall()]
     if 'lichess_token' not in columns:
         c.execute("ALTER TABLE users ADD COLUMN lichess_token TEXT")
+    if 'surname' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN surname TEXT")
     conn.commit()
     conn.close()
 
@@ -158,6 +164,15 @@ def save_user_token(vk_id, token):
     api_cache.clear()
 
 
+def save_user_surname(vk_id, surname):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET surname=? WHERE vk_id=?", (surname, vk_id))
+    conn.commit()
+    conn.close()
+    table_cache.clear()
+
+
 def save_token_cache(username, token):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -175,7 +190,7 @@ def get_token_from_cache(username):
     return row[0] if row else None
 
 
-# --- LICHESS API (С ЗАЩИТОЙ ОТ 429 И USER-AGENT) ---
+# --- LICHESS API ---
 async def fetch_lichess_json(url, token=None):
     headers = {"User-Agent": "VK-ChessClubBot/1.0"}
     if token:
@@ -313,7 +328,7 @@ async def get_all_team_tournaments():
     return tournaments
 
 
-# --- ЗАГРУЗКА ФОТО В VK ---
+# --- ЗАГРУЗКА ФОТО И ДОКУМЕНТОВ В VK ---
 async def upload_photo_to_vk(api, peer_id, file_path):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Файл {file_path} не найден")
@@ -332,6 +347,32 @@ async def upload_photo_to_vk(api, peer_id, file_path):
     if hasattr(saved, "response"): saved = saved.response
     photo = saved[0] if isinstance(saved, list) else saved
     return f"photo{photo.owner_id}_{photo.id}"
+
+
+async def upload_doc_to_vk(api, peer_id, file_path, title):
+    server = await api.docs.get_messages_upload_server(peer_id=peer_id)
+    upload_url = server.upload_url
+
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        file_content,
+        filename=os.path.basename(file_path),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(upload_url, data=form) as resp:
+            upload_data = await resp.json()
+
+    saved = await api.docs.save(file=upload_data["file"], title=title)
+    if hasattr(saved, "response"): saved = saved.response
+
+    doc = saved[0] if isinstance(saved, list) else saved
+    return f"doc{doc.owner_id}_{doc.id}"
 
 
 # --- РАСЧЕТ ПЕРИОДОВ ---
@@ -360,20 +401,18 @@ async def fetch_member_data(client, username, start_date, end_date):
         headers["Authorization"] = f"Bearer {token}"
 
     async def fetch_lines(url):
-        for attempt in range(4):  # УВЕЛИЧИЛИ КОЛИЧЕСТВО ПОПЫТОК
+        for attempt in range(3):
             try:
                 resp = await client.get(url, headers=headers, timeout=15.0)
                 if resp.status_code == 200:
                     return resp.text.strip().split('\n')
                 elif resp.status_code == 429:
-                    print(f"!!! 429 ЛИМИТ для {username}, ждем 10 сек...")
+                    print(f"!!! 429 ЛИМИТ для {username}, ждем 10 сек...", flush=True)
                     await asyncio.sleep(10)
                 elif resp.status_code == 404:
                     return []
-                else:
-                    print(f"!!! ОШИБКА {resp.status_code} для {username}")
-            except Exception as e:
-                print(f"!!! EXCEPTION для {username}: {e}")
+            except Exception:
+                pass
             await asyncio.sleep(3)
         return None
 
@@ -430,7 +469,7 @@ async def fetch_member_data(client, username, start_date, end_date):
     res = await asyncio.gather(get_arena(), get_swiss(), get_puzzles())
 
     if None in res:
-        raise Exception(f"Не удалось получить данные для {username}")
+        raise Exception(f"Fail {username}")
 
     arena_c, arena_w = res[0]
     swiss_c, swiss_w = res[1]
@@ -444,14 +483,22 @@ async def fetch_and_save_table_data(period_type):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        c.execute("SELECT lichess_username, surname FROM users WHERE lichess_username IS NOT NULL")
+        users_data = c.fetchall()
+
+        token_usernames = []
+        surname_map = {}
+        for uname, sname in users_data:
+            token_usernames.append(uname)
+            if sname:
+                surname_map[uname.lower()] = sname.strip()
+
         c.execute("SELECT username FROM token_cache")
-        token_usernames = [row[0] for row in c.fetchall()]
-        c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
-        known_names = {row[0].lower(): row[0] for row in c.fetchall()}
+        cache_usernames = [row[0] for row in c.fetchall()]
         conn.close()
 
-        token_usernames = [known_names.get(u.lower(), u) for u in token_usernames]
-        if not token_usernames: return False
+        members_list = list(set([u.lower() for u in token_usernames] + cache_usernames))
+        if not members_list: return False
 
         old_rows_dict = {}
         if os.path.exists(CACHE_FILE):
@@ -464,7 +511,7 @@ async def fetch_and_save_table_data(period_type):
             except Exception:
                 pass
 
-        members = [{"id": u} for u in token_usernames]
+        members = [{"id": u} for u in members_list]
         new_results = []
         processed_count = 0
 
@@ -473,7 +520,7 @@ async def fetch_and_save_table_data(period_type):
         async def fetch_all():
             nonlocal processed_count
             async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-                sem = asyncio.Semaphore(3)  # Уменьшили до 3, чтобы не злить Lichess
+                sem = asyncio.Semaphore(3)
 
                 async def bounded_fetch(m):
                     nonlocal processed_count
@@ -485,7 +532,7 @@ async def fetch_and_save_table_data(period_type):
                             processed_count += 1
                             print(f"=== [СБОР] {processed_count}/{len(members)}: {username} ===", flush=True)
                             return res
-                        except Exception as e:
+                        except Exception:
                             processed_count += 1
                             print(f"=== [ОШИБКА] {processed_count}/{len(members)}: {username} ===", flush=True)
                             return None
@@ -494,9 +541,8 @@ async def fetch_and_save_table_data(period_type):
                     batch = members[i:i + 3]
                     batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
                     new_results.extend(batch_results)
-                    await asyncio.sleep(2)  # Отдыхаем 2 сек
+                    await asyncio.sleep(2)
 
-        # УБРАЛИ ASYNCIO.WAIT_FOR (Теперь нет лимита в 3 минуты)
         await fetch_all()
 
         print("\n=== [СБОР] ЗАВЕРШЕН. ОБРАБОТКА РЕЗУЛЬТАТОВ... ===\n", flush=True)
@@ -506,13 +552,18 @@ async def fetch_and_save_table_data(period_type):
             username = m["id"]
             new_res = next((r for r in new_results if r and r[0].lower() == username.lower()), None)
 
+            # Гарантируем, что фамилия будет пустой строкой, если её нет
+            sname = (surname_map.get(username.lower()) or "").strip()
+
             if new_res:
-                final_rows.append(new_res)
+                final_rows.append((new_res[0], new_res[1], new_res[2], new_res[3], sname))
             else:
                 if username.lower() in old_rows_dict:
-                    final_rows.append(old_rows_dict[username.lower()])
+                    old_r = old_rows_dict[username.lower()]
+                    old_sname = old_r[4] if len(old_r) > 4 else ""
+                    final_rows.append((old_r[0], old_r[1], old_r[2], old_r[3], (old_sname or sname).strip()))
                 else:
-                    final_rows.append((username, 0, 0, 0))
+                    final_rows.append((username, 0, 0, 0, sname))
 
         if final_rows:
             final_rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
@@ -580,10 +631,10 @@ async def fetch_and_save_club_data():
         with open(CLUB_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump({"text": text, "timestamp": time.time()}, f, ensure_ascii=False)
 
-        print("=== СТАТИСТИКА КЛУБА ОБНОВЛЕНА ===")
+        print("=== СТАТИСТИКА КЛУБА ОБНОВЛЕНА ===", flush=True)
         return True
     except Exception as e:
-        print(f"!!! ОШИБКА СТАТИСТИКИ КЛУБА: {e}")
+        print(f"!!! ОШИБКА СТАТИСТИКИ КЛУБА: {e}", flush=True)
     return False
 
 
@@ -597,11 +648,12 @@ async def background_updater_loop():
         next_midnight = (now_msk + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         seconds_until_midnight = (next_midnight - now_msk).total_seconds()
 
-        print(f"=== СЛЕДУЮЩЕЕ ОБНОВЛЕНИЕ ЗАПЛАНИРОВАНО НА {next_midnight.strftime('%d.%m.%Y %H:%M')} МСК ===")
+        print(f"=== СЛЕДУЮЩЕЕ ОБНОВЛЕНИЕ ЗАПЛАНИРОВАНО НА {next_midnight.strftime('%d.%m.%Y %H:%M')} МСК ===",
+              flush=True)
 
         await asyncio.sleep(seconds_until_midnight)
 
-        print("=== 00:00 МСК: СБРОС КЭШЕЙ И ЗАПУСК ОБНОВЛЕНИЯ ===")
+        print("=== 00:00 МСК: СБРОС КЭШЕЙ И ЗАПУСК ОБНОВЛЕНИЯ ===", flush=True)
 
         daily_puzzle_cache["data"] = None
         daily_puzzle_cache["timestamp"] = 0
@@ -624,7 +676,70 @@ async def background_updater_loop():
         await asyncio.sleep(5)
         await fetch_and_save_club_data()
 
-        print("=== НОЧНОЕ ОБНОВЛЕНИЕ ЗАВЕРШЕНО ===")
+        print("=== НОЧНОЕ ОБНОВЛЕНИЕ ЗАВЕРШЕНО ===", flush=True)
+
+
+# =====================================================================
+# ГЕНЕРАЦИЯ EXCEL ФАЙЛА
+# =====================================================================
+def generate_excel_table(period_type):
+    cache_entry = table_cache.get(period_type)
+    if not cache_entry:
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                    if period_type in cached_data:
+                        cache_entry = cached_data[period_type]
+            except Exception:
+                pass
+
+    if not cache_entry:
+        return None
+
+    rows = cache_entry.get("data", [])
+    if not rows:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Таблица активности"
+
+    headers = ["Место", "Фамилия", "Ник Lichess", "Задачи", "Турниры", "Победы", "Всего баллов"]
+    ws.append(headers)
+
+    for col in range(1, 8):
+        cell = ws.cell(row=1, column=col)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, r in enumerate(rows, 1):
+        username = r[0]
+        puzzles = r[1]
+        tourns = r[2]
+        wins = r[3]
+        # Здесь тоже гарантируем пустоту, если фамилии нет
+        surname = (r[4] or "").strip() if len(r) > 4 else ""
+        total = puzzles + tourns
+
+        # Если фамилии нет, в ячейке будет просто пусто
+        ws.append([i, surname, username, puzzles, tourns, wins, total])
+
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[column].width = adjusted_width
+
+    filepath = data_dir / f"table_{period_type}.xlsx"
+    wb.save(filepath)
+    return str(filepath)
 
 
 # =====================================================================
@@ -632,9 +747,11 @@ async def background_updater_loop():
 # =====================================================================
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
+
     keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
                  color=KeyboardButtonColor.POSITIVE)
     keyboard.row()
+
     keyboard.add(Text("👤 Статистика игрока", payload={"cmd": "menu_player"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🧩 Статистика задач", payload={"cmd": "menu_puzzles"}), color=KeyboardButtonColor.PRIMARY)
@@ -646,10 +763,14 @@ def get_main_keyboard():
     keyboard.add(Text("📊 Статистика для руководителей клуба", payload={"cmd": "leaders_menu"}),
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
+
+    keyboard.add(Text("📝 Добавить фамилию", payload={"cmd": "add_surname"}), color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
     keyboard.add(Text("🎯 Задача дня", payload={"cmd": "daily_puzzle"}), color=KeyboardButtonColor.SECONDARY)
     keyboard.add(Text("🔄 Сменить ник", payload={"cmd": "change_nick"}), color=KeyboardButtonColor.NEGATIVE)
     keyboard.row()
     keyboard.add(Text("🔑 Мой токен Lichess", payload={"cmd": "set_token"}), color=KeyboardButtonColor.SECONDARY)
+
     return keyboard.get_json()
 
 
@@ -659,6 +780,21 @@ def get_leaders_menu_keyboard():
                  color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("📊 Таблица участников", payload={"cmd": "table_members"}), color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
+    keyboard.add(Text("📥 Загрузить таблицу в Excel", payload={"cmd": "download_excel_menu"}),
+                 color=KeyboardButtonColor.POSITIVE)
+    keyboard.row()
+    keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
+    return keyboard.get_json()
+
+
+def get_download_excel_keyboard():
+    keyboard = Keyboard(one_time=False, inline=False)
+    keyboard.add(Text("🍂 Осенний период", payload={"cmd": "download_excel_period", "type": "autumn"}),
+                 color=KeyboardButtonColor.PRIMARY)
+    keyboard.row()
+    keyboard.add(Text("🌸 Весенний период", payload={"cmd": "download_excel_period", "type": "spring"}),
+                 color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
     keyboard.add(Text("🔙 В главное меню", payload={"cmd": "back_main"}), color=KeyboardButtonColor.SECONDARY)
     return keyboard.get_json()
@@ -834,14 +970,26 @@ async def send_table_page(target, period_type, page, is_edit=False):
     text = f"📊Таблица активности участников\n{period_name}\n📅 {date_range}\n\nРейтинг участников · стр. {page + 1}/{total_pages}\n\n"
 
     if page_rows:
-        for i, (username, puzzles, tourns, wins) in enumerate(page_rows, start_idx + 1):
+        for i, r in enumerate(page_rows, start_idx + 1):
+            username = r[0]
+            puzzles = r[1]
+            tourns = r[2]
+            wins = r[3]
+
+            # Берем фамилию. Если её нет, будет пустая строка.
+            surname = (r[4] or "").strip() if len(r) > 4 else ""
+
+            # Если фамилия пустая, выводим только ник. Если есть - "Фамилия Ник"
+            display_name = f"{surname} {username}".strip() if surname else username
+
             total = puzzles + tourns
             ball_word = pluralize(total, ('балл', 'балла', 'баллов'))
             task_word = pluralize(puzzles, ('задача', 'задачи', 'задач'))
             tourn_word = pluralize(tourns, ('турнир', 'турнира', 'турниров'))
             win_word = pluralize(wins, ('победа', 'победы', 'побед'))
             prefix = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
-            text += f"{prefix} {username} — {total} {ball_word}\n\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word} · 🥇 {wins} {win_word}\n"
+
+            text += f"{prefix} {display_name} — {total} {ball_word}\n\u00A0\u00A0\u00A0\u00A0\u00A0🧩 {puzzles} {task_word} · 🏆 {tourns} {tourn_word} · 🥇 {wins} {win_word}\n"
     else:
         text += "На этой странице нет участников.\n"
 
@@ -854,6 +1002,7 @@ async def send_table_page(target, period_type, page, is_edit=False):
         f"👥 Участников с токеном: {len(rows)} (активных: {active_count})")
 
     keyboard = Keyboard(one_time=False, inline=False)
+
     keyboard.add(Text("🔄 Обновить данные", payload={"cmd": "table_update", "type": period_type}),
                  color=KeyboardButtonColor.SECONDARY)
     keyboard.row()
@@ -895,16 +1044,13 @@ async def send_table_page(target, period_type, page, is_edit=False):
 # РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
 # =====================================================================
 def register_handlers(bot: Bot):
-    @bot.on.message(text="!version")
-    async def version_handler(message: Message):
-        await message.answer("✅ Код обновлен! Версия с [СБОР] активна.")
-
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
+        waiting_for_surname.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         user = get_user_lichess(message.from_id)
         if user:
@@ -923,10 +1069,28 @@ def register_handlers(bot: Bot):
         waiting_for_nick.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
+        waiting_for_surname.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         waiting_for_token.add(message.from_id)
         await message.answer(
             f"🔑 Отправьте ваш персональный токен Lichess.\n\nОн должен принадлежать вашему аккаунту: {user}.\nЕго можно создать здесь: https://lichess.org/account/oauth/token/create\n",
+            keyboard=Keyboard(one_time=True).get_json())
+
+    @bot.on.message(payload_contains={"cmd": "add_surname"})
+    async def add_surname_handler(message: Message):
+        user = get_user_lichess(message.from_id)
+        if not user:
+            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
+            return
+        waiting_for_nick.discard(message.from_id)
+        waiting_for_token.discard(message.from_id)
+        waiting_for_member_nick.discard(message.from_id)
+        waiting_for_table.discard(message.from_id)
+        pending_member_target.pop(message.from_id, None)
+        waiting_for_surname.add(message.from_id)
+
+        await message.answer(
+            "📝 Введите вашу фамилию (например, Иванов).\nОна будет отображаться в таблице участников перед ником.",
             keyboard=Keyboard(one_time=True).get_json())
 
     @bot.on.message(payload_contains={"cmd": "leaders_menu"})
@@ -956,11 +1120,11 @@ def register_handlers(bot: Bot):
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
+        waiting_for_surname.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         waiting_for_member_nick.add(message.from_id)
-        await message.answer(
-            "Введите ник участника клуба на Lichess, чтобы посмотреть его статистику за выбранный период:",
-            keyboard=Keyboard(one_time=True).get_json())
+        await message.answer("Введите ник участника клуба на Lichess или его фамилию:",
+                             keyboard=Keyboard(one_time=True).get_json())
 
     @bot.on.message(payload_contains={"cmd": "table_members"})
     async def table_members_handler(message: Message):
@@ -971,9 +1135,46 @@ def register_handlers(bot: Bot):
         waiting_for_nick.discard(message.from_id)
         waiting_for_token.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
+        waiting_for_surname.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         waiting_for_table.add(message.from_id)
         await message.answer("Выберите период для таблицы участников:", keyboard=get_table_period_keyboard())
+
+    @bot.on.message(payload_contains={"cmd": "download_excel_menu"})
+    async def download_excel_menu_handler(message: Message):
+        user = get_user_lichess(message.from_id)
+        if not user or not await is_club_leader(user):
+            await message.answer("❌ Эта функция доступна только руководителям.")
+            return
+        await message.answer("Выберите период, за который нужно скачать таблицу в Excel:",
+                             keyboard=get_download_excel_keyboard())
+
+    @bot.on.message(payload_contains={"cmd": "download_excel_period"})
+    async def download_excel_period_handler(message: Message):
+        payload_data = json.loads(message.payload) if isinstance(message.payload, str) else message.payload
+        period_type = payload_data.get("type", "autumn")
+
+        if period_type not in table_cache and not os.path.exists(CACHE_FILE):
+            await message.answer("⏳ Данных пока нет. Сначала собираю таблицу (это займет время)...")
+            await fetch_and_save_table_data(period_type)
+
+        await message.answer("⏳ Генерирую Excel файл...")
+
+        filepath = generate_excel_table(period_type)
+        if not filepath:
+            await message.answer(
+                "⚠️ Нет данных для создания файла. Сначала откройте таблицу в боте, чтобы она собралась.")
+            return
+
+        try:
+            attachment = await upload_doc_to_vk(message.ctx_api, message.peer_id, filepath,
+                                                f"Таблица_{period_type}.xlsx")
+            await message.answer(f"📊 Таблица за {period_type} в формате Excel:", attachment=attachment)
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка при загрузке файла: {e}")
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     @bot.on.message(payload_contains={"cmd": "table_period"})
     async def table_period_handler(message: Message):
@@ -1186,6 +1387,7 @@ def register_handlers(bot: Bot):
         pending_member_target.pop(message.from_id, None)
         waiting_for_member_nick.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
+        waiting_for_surname.discard(message.from_id)
         user = get_user_lichess(message.from_id)
         await message.answer(f"👋 Главное меню\n\nВы привязаны как: {user}\nВыберите, что хотите посмотреть:",
                              keyboard=get_main_keyboard())
@@ -1196,6 +1398,7 @@ def register_handlers(bot: Bot):
         waiting_for_token.discard(message.from_id)
         waiting_for_member_nick.discard(message.from_id)
         waiting_for_table.discard(message.from_id)
+        waiting_for_surname.discard(message.from_id)
         pending_member_target.pop(message.from_id, None)
         await message.answer("🔗 Регистрация\n\nОтправьте ваш новый ник на Lichess:",
                              keyboard=Keyboard(one_time=True).get_json())
@@ -1489,6 +1692,18 @@ def register_handlers(bot: Bot):
                                  keyboard=get_main_keyboard())
             return
 
+        if message.from_id in waiting_for_surname:
+            surname = text.strip()
+            if not surname or len(surname) > 30:
+                await message.answer("❌ Некорректная фамилия. Попробуйте еще раз:")
+                return
+
+            save_user_surname(message.from_id, surname)
+            waiting_for_surname.discard(message.from_id)
+            await message.answer(f"✅ Фамилия '{surname}' успешно сохранена и будет отображаться в таблице!",
+                                 keyboard=get_main_keyboard())
+            return
+
         if message.from_id in waiting_for_nick:
             username = text.strip()
             if not username or len(username) > 30 or " " in username:
@@ -1526,18 +1741,34 @@ def register_handlers(bot: Bot):
             return
 
         if message.from_id in waiting_for_member_nick:
-            target_username = text.strip()
-            if not target_username or len(target_username) > 30 or " " in target_username:
-                await message.answer("❌ Некорректный ник. Попробуйте еще раз (без пробелов):")
-                return
-            await message.answer("⏳ Проверяю ник на Lichess...")
-            if not await check_user_exists(target_username):
-                await message.answer(f"❌ Игрок {target_username} не найден на Lichess.\nПопробуйте другой ник:")
-                return
+            query = text.strip()
+
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute(
+                "SELECT lichess_username, surname FROM users WHERE LOWER(lichess_username)=LOWER(?) OR LOWER(surname)=LOWER(?)",
+                (query, query))
+            row = c.fetchone()
+            conn.close()
+
+            target_username = None
+            if row:
+                target_username = row[0]
+                display_surname = row[1]
+                await message.answer(
+                    f"✅ Найден участник: {display_surname} ({target_username})" if display_surname else f"✅ Найден участник: {target_username}")
+            else:
+                await message.answer("⏳ Проверяю ник на Lichess...")
+                if await check_user_exists(query):
+                    target_username = query
+                else:
+                    await message.answer(f"❌ Игрок или фамилия '{query}' не найдены.")
+                    return
+
             pending_member_target[message.from_id] = target_username
             waiting_for_member_nick.discard(message.from_id)
-            await message.answer(f"Участник: {target_username}\nВыберите период для просмотра статистики:",
-                                 keyboard=get_member_period_keyboard())
+
+            await message.answer(f"Выберите период для просмотра статистики:", keyboard=get_member_period_keyboard())
             return
 
         await message.answer("Пожалуйста, пользуйтесь кнопками в меню ниже, или напишите 'Начать'.",
