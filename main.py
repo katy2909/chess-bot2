@@ -362,13 +362,12 @@ async def upload_doc_to_vk(api, peer_id, file_path, title):
 
 # --- РАСЧЕТ ПЕРИОДОВ ---
 def get_period_dates(period_type):
-    current_year = datetime.now().year
     if period_type == "autumn":
-        start = date(current_year, 9, 1)
-        end = date(current_year, 12, 15)
+        start = date(2026, 9, 1)
+        end = date(2026, 12, 15)
     else:
-        start = date(current_year, 2, 1)
-        end = date(current_year, 5, 15)
+        start = date(2027, 2, 1)
+        end = date(2027, 5, 15)
     return start, end
 
 
