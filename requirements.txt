@@ -2,3 +2,4 @@ vkbottle
 httpx
 aiohttp
 loguru
+openpyxl
