@@ -660,13 +660,20 @@ async def fetch_and_save_club_data():
                     for i, p in enumerate(mode_profiles[:5], 1):
                         top_players_text += f"{i}. {p.get('username', 'Unknown')} — {get_mode_rating(p)}\n"
 
+        total_t = len(tournaments)
+        ongoing_t = len([t for t in tournaments if t.get('status') == 20])
+        upcoming_t = len([t for t in tournaments if t.get('status') == 10])
+
+        # Считаем завершенные по вашей формуле
+        finished_t = total_t - ongoing_t - upcoming_t
+
         text = (
             f"🏆 Статистика клуба: {team_info.get('name', 'Наш клуб')}\n\n"
             f"👥 Участников: {team_info.get('nbMembers', 0)}\n"
-            f"📊 Всего турниров: {len(tournaments)}\n"
-            f"⏳ Идущих: {len([t for t in tournaments if t.get('status') == 20])}\n"
-            f"📅 Предстоящих: {len([t for t in tournaments if t.get('status') == 10])}\n"
-            f"🏁 Завершённых: {len([t for t in tournaments if t.get('status') == 30])}\n"
+            f"📊 Всего турниров: {total_t}\n"
+            f"⏳ Идущих: {ongoing_t}\n"
+            f"📅 Предстоящих: {upcoming_t}\n"
+            f"🏁 Завершённых: {finished_t}\n"
             f"{top_players_text}\n"
         )
 
