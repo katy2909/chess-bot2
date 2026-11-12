@@ -370,11 +370,14 @@ async def fetch_championship_data():
     print("=== [ЧЕМПИОНАТ] Загрузка данных... ===", flush=True)
     tournaments = await get_all_team_tournaments()
 
-    # Фильтруем по ключевым словам (берем ВСЕ турниры, не только завершенные)
-    champ_tours = [
-        t for t in tournaments
-        if any(kw.lower() in t.get('name', '').lower() for kw in CHAMP_KEYWORDS)
-    ]
+    # Фильтруем по ключевым словам (берем ВСЕ турниры: и завершенные, и предстоящие)
+    champ_tours = []
+    for t in tournaments:
+        # ИСПРАВЛЕНИЕ: Берем fullName (как отдает Lichess), а не name
+        t_name = t.get('fullName', t.get('name', ''))
+        if any(kw.lower() in t_name.lower() for kw in CHAMP_KEYWORDS):
+            champ_tours.append(t)
+
     # Сортируем по дате (от старых к новым)
     champ_tours.sort(key=lambda x: x.get('startsAt', 0))
 
@@ -384,7 +387,7 @@ async def fetch_championship_data():
     for t in champ_tours:
         t_id = t['id']
         t_type = t.get('type', 'arena')
-        t_name = t.get('name', 'Без названия')
+        t_name = t.get('fullName', t.get('name', 'Без названия'))
         t_date = format_date(t.get('startsAt'))
         t_status = t.get('status', 0)
 
@@ -415,7 +418,7 @@ async def fetch_championship_data():
                         "username": username,
                         "points": pts
                     })
-            await asyncio.sleep(1)  # Пауза между запросами
+            await asyncio.sleep(1)
 
         stages.append({
             "id": t_id,
@@ -1299,7 +1302,7 @@ def register_handlers(bot: Bot):
 
         if not await is_club_leader(user):
             await message.answer(
-                f"❌ Эта функция доступна только руководителям.\n\nВаш текущий ник: {user}\n(Проверьте, есть ли он в списке LEADER_USERNAMES в коде)")
+                f"❌ Эта функция доступна только руководителям.\n\nВаш текущий ник: {user}\n(Проверьте, есть ли он в списке LEADER_USERNAMES)")
             return
 
         await message.answer("📊 Статистика для руководителей клуба\nВыберите раздел:",
