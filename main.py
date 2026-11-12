@@ -1306,7 +1306,7 @@ def register_handlers(bot: Bot):
 
         if not await is_club_leader(user):
             await message.answer(
-                f"❌ Эта функция доступна только руководителям.\n\nВаш текущий ник: {user}\n(Проверьте, есть ли он в списке LEADER_USERNAMES)")
+                f"❌ Эта функция доступна только руководителям.")
             return
 
         await message.answer("📊 Статистика для руководителей клуба\nВыберите раздел:",
