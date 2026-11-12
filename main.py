@@ -1147,6 +1147,10 @@ async def send_table_page(target, period_type, page, is_edit=False):
 # =====================================================================
 # РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
 # =====================================================================
+async def is_club_leader(username):
+    if not username:
+        return False
+    return username.lower() in [u.lower() for u in LEADER_USERNAMES]
 def register_handlers(bot: Bot):
     @bot.on.message(text=["Начать", "начать", "Start", "start", "/Start", "/start"])
     async def start_handler(message: Message):
