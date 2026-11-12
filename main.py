@@ -461,7 +461,7 @@ def generate_excel_table(period_type):
 def get_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
     keyboard.add(Text("🏆 Чемпионат Under Pressure", payload={"cmd": "champ_under_pressure"}),
-                 color=KeyboardButtonColor.POSITIVE)
+                 color=KeyboardButtonColor.NEGATIVE)
     keyboard.row()
     keyboard.add(Text("👤 Статистика игрока", payload={"cmd": "menu_player"}), color=KeyboardButtonColor.PRIMARY)
     keyboard.row()
