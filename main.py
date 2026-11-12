@@ -59,8 +59,6 @@ LEADER_USERNAMES = ["PavelMart", "R-23", "Kurerov", "Cheburahka_CHM", "Kate_pank
 # Ключевые слова для чемпионата
 CHAMP_KEYWORDS = ["Under Pressure"]
 
-UNDER_PRESSURE_PHOTO = "under_pressure.png"
-
 # =====================================================================
 # 📂 НАСТРОЙКА ПОСТОЯННОГО ХРАНИЛИЩА (ДЛЯ BOTHOST)
 # =====================================================================
@@ -136,6 +134,16 @@ def get_champ_points(rank):
     elif rank >= 21:
         return 1
     return 0
+
+
+def get_period_dates(period_type):
+    if period_type == "autumn":
+        start = date(2026, 9, 1)
+        end = date(2026, 12, 15)
+    else:
+        start = date(2027, 2, 1)
+        end = date(2027, 5, 15)
+    return start, end
 
 
 # --- БАЗА ДАННЫХ ---
@@ -305,6 +313,22 @@ async def check_token_valid(token, expected_username):
             return False
 
 
+async def fetch_users_profiles(usernames):
+    if not usernames:
+        return []
+    ids_str = ",".join(usernames[:300])
+    url = "https://lichess.org/api/users"
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
+    async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
+        try:
+            resp = await client.post(url, data=ids_str, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+        except Exception:
+            return []
+
+
 async def get_all_team_tournaments():
     if time.time() - tournaments_cache["timestamp"] < 3600 and tournaments_cache["data"]:
         return tournaments_cache["data"]
@@ -312,11 +336,13 @@ async def get_all_team_tournaments():
     tournaments = []
     try:
         arenas = await fetch_lichess_ndjson(f"https://lichess.org/api/team/{TEAM_ID}/arena")
+        for a in arenas: a['type'] = 'arena'
         tournaments.extend(arenas)
     except Exception:
         pass
     try:
         swisses = await fetch_lichess_ndjson(f"https://lichess.org/api/team/{TEAM_ID}/swiss")
+        for s in swisses: s['type'] = 'swiss'
         tournaments.extend(swisses)
     except Exception:
         pass
@@ -338,7 +364,6 @@ async def upload_doc_to_vk(api, peer_id, file_path, title):
 
 # --- СБОР ДАННЫХ ЧЕМПИОНАТА ---
 async def fetch_championship_data():
-    # Если кэш свежий (меньше 1 часа), отдаем его
     if "data" in champ_cache and time.time() - champ_cache["timestamp"] < 3600:
         return champ_cache["data"]
 
@@ -350,7 +375,6 @@ async def fetch_championship_data():
         t for t in tournaments
         if any(kw.lower() in t.get('name', '').lower() for kw in CHAMP_KEYWORDS) and t.get('status') == 30
     ]
-    # Сортируем по дате начала (от старых к новым)
     champ_tours.sort(key=lambda x: x.get('startsAt', 0))
 
     overall_points = defaultdict(int)
@@ -358,14 +382,22 @@ async def fetch_championship_data():
 
     for t in champ_tours:
         t_id = t['id']
+        t_type = t.get('type', 'arena')
         t_name = t.get('name', 'Без названия')
         t_date = format_date(t.get('startsAt'))
 
-        results = await fetch_lichess_ndjson(f"https://lichess.org/api/tournament/{t_id}/results")
+        if t_type == 'arena':
+            url = f"https://lichess.org/api/tournament/{t_id}/results"
+        else:
+            url = f"https://lichess.org/api/swiss/{t_id}/results"
+
+        results = await fetch_lichess_ndjson(url)
 
         stage_results = []
-        # Проходим по всем игрокам (чтобы учесть 21+ место)
-        for p in results:
+        # БЕРЕМ ТОЛЬКО ТОП-20
+        top_20 = results[:20]
+
+        for p in top_20:
             rank = p.get('rank', 999)
             username = p.get('username')
             if username:
@@ -383,9 +415,8 @@ async def fetch_championship_data():
             "date": t_date,
             "results": stage_results
         })
-        await asyncio.sleep(1)  # Пауза, чтобы не забанили
+        await asyncio.sleep(1)
 
-    # Сортируем общий зачет по баллам
     sorted_overall = sorted(overall_points.items(), key=lambda x: x[1], reverse=True)
 
     result_data = {
@@ -397,6 +428,289 @@ async def fetch_championship_data():
     champ_cache["timestamp"] = time.time()
     print("=== [ЧЕМПИОНАТ] Данные успешно загружены ===", flush=True)
     return result_data
+
+
+# =====================================================================
+# СБОР ДАННЫХ ДЛЯ ТАБЛИЦЫ И СТАТИСТИКИ КЛУБА
+# =====================================================================
+async def fetch_member_data(client, username, start_date, end_date):
+    token = get_token_from_cache(username)
+    headers = {"User-Agent": "VK-ChessClubBot/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    async def fetch_lines(url):
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, headers=headers, timeout=15.0)
+                if resp.status_code == 200:
+                    return resp.text.strip().split('\n')
+                elif resp.status_code == 429:
+                    print(f"!!! 429 ЛИМИТ для {username}, ждем 10 сек...", flush=True)
+                    await asyncio.sleep(10)
+                elif resp.status_code == 404:
+                    return []
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+        return None
+
+    async def get_arena():
+        lines = await fetch_lines(f"https://lichess.org/api/user/{username.lower()}/tournament/played")
+        if lines is None: return None
+        count, wins = 0, 0
+        for line in lines:
+            if not line.strip(): continue
+            try:
+                t = json.loads(line)
+                starts_at = t.get('tournament', {}).get('startsAt', 0)
+                t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                if start_date <= t_date <= end_date:
+                    count += 1
+                    if t.get('player', {}).get('rank') == 1: wins += 1
+            except Exception:
+                continue
+        return count, wins
+
+    async def get_swiss():
+        lines = await fetch_lines(f"https://lichess.org/api/user/{username.lower()}/swiss/played")
+        if lines is None: return None
+        count, wins = 0, 0
+        for line in lines:
+            if not line.strip(): continue
+            try:
+                t = json.loads(line)
+                starts_at = t.get('tournament', {}).get('startsAt', 0)
+                t_date = datetime.fromtimestamp(starts_at / 1000).date()
+                if start_date <= t_date <= end_date:
+                    count += 1
+                    if t.get('player', {}).get('rank') == 1: wins += 1
+            except Exception:
+                continue
+        return count, wins
+
+    async def get_puzzles():
+        if not token: return 0
+        lines = await fetch_lines("https://lichess.org/api/puzzle/activity")
+        if lines is None: return None
+        count = 0
+        for line in lines:
+            if not line.strip(): continue
+            try:
+                entry = json.loads(line)
+                event_ts = entry.get("date", 0)
+                event_date = datetime.fromtimestamp(event_ts / 1000).date()
+                if start_date <= event_date <= end_date: count += 1
+            except Exception:
+                continue
+        return count
+
+    res = await asyncio.gather(get_arena(), get_swiss(), get_puzzles())
+
+    if None in res:
+        raise Exception(f"Fail {username}")
+
+    arena_c, arena_w = res[0]
+    swiss_c, swiss_w = res[1]
+    puzzles_c = res[2]
+
+    return (username, puzzles_c, arena_c + swiss_c, arena_w + swiss_w)
+
+
+async def fetch_and_save_table_data(period_type):
+    start_date, end_date = get_period_dates(period_type)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT lichess_username FROM users WHERE lichess_username IS NOT NULL")
+        token_usernames = [row[0] for row in c.fetchall()]
+
+        c.execute("SELECT username, surname FROM surnames")
+        surname_map = {row[0].lower(): row[1] for row in c.fetchall()}
+
+        c.execute("SELECT username FROM token_cache")
+        cache_usernames = [row[0] for row in c.fetchall()]
+        conn.close()
+
+        members_list = list(set([u.lower() for u in token_usernames] + cache_usernames))
+        if not members_list: return False
+
+        old_rows_dict = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                    if period_type in cached_data:
+                        for r in cached_data[period_type]["data"]:
+                            old_rows_dict[r[0].lower()] = tuple(r)
+            except Exception:
+                pass
+
+        members = [{"id": u} for u in members_list]
+        new_results = []
+        processed_count = 0
+
+        print(f"\n=== [СБОР] НАЧАЛО. Всего участников: {len(members)} ===\n", flush=True)
+
+        async def fetch_all():
+            nonlocal processed_count
+            async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+                sem = asyncio.Semaphore(3)
+
+                async def bounded_fetch(m):
+                    nonlocal processed_count
+                    async with sem:
+                        username = m.get('id')
+                        if not username: return None
+                        try:
+                            res = await fetch_member_data(client, username, start_date, end_date)
+                            processed_count += 1
+                            print(f"=== [СБОР] {processed_count}/{len(members)}: {username} ===", flush=True)
+                            return res
+                        except Exception:
+                            processed_count += 1
+                            print(f"=== [ОШИБКА] {processed_count}/{len(members)}: {username} ===", flush=True)
+                            return None
+
+                for i in range(0, len(members), 3):
+                    batch = members[i:i + 3]
+                    batch_results = await asyncio.gather(*(bounded_fetch(m) for m in batch))
+                    new_results.extend(batch_results)
+                    await asyncio.sleep(2)
+
+        await fetch_all()
+
+        print("\n=== [СБОР] ЗАВЕРШЕН. ОБРАБОТКА РЕЗУЛЬТАТОВ... ===\n", flush=True)
+
+        final_rows = []
+        for m in members:
+            username = m["id"]
+            new_res = next((r for r in new_results if r and r[0].lower() == username.lower()), None)
+            sname = (surname_map.get(username.lower()) or "").strip()
+
+            if new_res:
+                final_rows.append((new_res[0], new_res[1], new_res[2], new_res[3], sname))
+            else:
+                if username.lower() in old_rows_dict:
+                    old_r = old_rows_dict[username.lower()]
+                    old_sname = old_r[4] if len(old_r) > 4 else ""
+                    final_rows.append((old_r[0], old_r[1], old_r[2], old_r[3], (old_sname or sname).strip()))
+                else:
+                    final_rows.append((username, 0, 0, 0, sname))
+
+        if final_rows:
+            final_rows.sort(key=lambda x: (-(x[1] + x[2]), -x[3], x[0].lower()))
+
+            cached_data = {}
+            if os.path.exists(CACHE_FILE):
+                try:
+                    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                        cached_data = json.load(f)
+                except Exception:
+                    pass
+
+            cached_data[period_type] = {"data": final_rows, "timestamp": time.time()}
+            table_cache[period_type] = cached_data[period_type]
+
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cached_data, f, ensure_ascii=False)
+            print(f"\n=== [СБОР] ТАБЛИЦА {period_type} УСПЕШНО СОХРАНЕНА ===\n", flush=True)
+            return True
+    except Exception as e:
+        print(f"\n!!! [СБОР] ГЛОБАЛЬНАЯ ОШИБКА: {e}\n", flush=True)
+    return False
+
+
+async def fetch_and_save_club_data():
+    try:
+        team_info = await fetch_lichess_json(f"https://lichess.org/api/team/{TEAM_ID}")
+        if not team_info or 'nbMembers' not in team_info:
+            return False
+
+        tournaments = await get_all_team_tournaments()
+        top_players_text = ""
+
+        members = await fetch_lichess_ndjson(f"https://lichess.org/api/team/{TEAM_ID}/users")
+        if members:
+            usernames = [m.get('id') for m in members if m.get('id')]
+            profiles = await fetch_users_profiles(usernames)
+            modes = [('blitz', '⚡ Блиц'), ('rapid', '🐢 Рапид'), ('bullet', '🚀 Пуля')]
+            for mode_key, mode_name in modes:
+                def get_mode_rating(p):
+                    perfs = p.get('perfs', {})
+                    r = perfs.get(mode_key, {}).get('rating', 0)
+                    return r if isinstance(r, int) else 0
+
+                mode_profiles = [p for p in profiles if get_mode_rating(p) > 0]
+                mode_profiles.sort(key=get_mode_rating, reverse=True)
+                if mode_profiles:
+                    top_players_text += f"\n👑 Топ-5 ({mode_name}):\n"
+                    for i, p in enumerate(mode_profiles[:5], 1):
+                        top_players_text += f"{i}. {p.get('username', 'Unknown')} — {get_mode_rating(p)}\n"
+
+        text = (
+            f"🏆 Статистика клуба: {team_info.get('name', 'Наш клуб')}\n\n"
+            f"👥 Участников: {team_info.get('nbMembers', 0)}\n"
+            f"📊 Всего турниров: {len(tournaments)}\n"
+            f"⏳ Идущих: {len([t for t in tournaments if t.get('status') == 20])}\n"
+            f"📅 Предстоящих: {len([t for t in tournaments if t.get('status') == 10])}\n"
+            f"🏁 Завершённых: {len([t for t in tournaments if t.get('status') == 30])}\n"
+            f"{top_players_text}\n"
+        )
+
+        club_stats_cache["text"] = text
+        club_stats_cache["timestamp"] = time.time()
+
+        with open(CLUB_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"text": text, "timestamp": time.time()}, f, ensure_ascii=False)
+
+        print("=== СТАТИСТИКА КЛУБА ОБНОВЛЕНА ===", flush=True)
+        return True
+    except Exception as e:
+        print(f"!!! ОШИБКА СТАТИСТИКИ КЛУБА: {e}", flush=True)
+    return False
+
+
+async def background_updater_loop():
+    await asyncio.sleep(15)
+
+    while True:
+        msk_tz = timezone(timedelta(hours=3))
+        now_msk = datetime.now(msk_tz)
+
+        next_midnight = (now_msk + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_midnight = (next_midnight - now_msk).total_seconds()
+
+        print(f"=== СЛЕДУЮЩЕЕ ОБНОВЛЕНИЕ ЗАПЛАНИРОВАНО НА {next_midnight.strftime('%d.%m.%Y %H:%M')} МСК ===",
+              flush=True)
+
+        await asyncio.sleep(seconds_until_midnight)
+
+        print("=== 00:00 МСК: СБРОС КЭШЕЙ И ЗАПУСК ОБНОВЛЕНИЯ ===", flush=True)
+
+        daily_puzzle_cache["data"] = None
+        daily_puzzle_cache["timestamp"] = 0
+        api_cache.clear()
+        tournaments_cache["data"] = []
+        champ_cache.clear()
+
+        for file_path in [CACHE_FILE, CLUB_CACHE_FILE]:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+
+        table_cache.clear()
+        club_stats_cache["text"] = ""
+
+        await fetch_and_save_table_data("autumn")
+        await asyncio.sleep(5)
+        await fetch_and_save_table_data("spring")
+        await asyncio.sleep(5)
+        await fetch_and_save_club_data()
+
+        print("=== НОЧНОЕ ОБНОВЛЕНИЕ ЗАВЕРШЕНО ===", flush=True)
 
 
 # =====================================================================
@@ -483,7 +797,6 @@ def get_main_keyboard():
     return keyboard.get_json()
 
 
-# Клавиатуры для Чемпионата
 def get_champ_main_keyboard():
     keyboard = Keyboard(one_time=False, inline=False)
     keyboard.add(Text("🏆 Турнирное положение", payload={"cmd": "champ_overall", "page": 0}),
@@ -1479,7 +1792,7 @@ def register_handlers(bot: Bot):
         club_stats_cache["text"] = ""
         tournaments_cache["data"] = []
         table_cache.clear()
-        champ_cache.clear()  # Очищаем кэш чемпионата
+        champ_cache.clear()
 
         deleted_files = []
         for file_path in [CACHE_FILE, CLUB_CACHE_FILE]:
@@ -1582,7 +1895,7 @@ def register_handlers(bot: Bot):
                 table_cache.clear()
                 api_cache.clear()
                 await message.answer(
-                    f"✅ Успешно! Вы привязаны как {username}.\n🔑 В базе найден сохраненный токен для этого ника.",
+                    f"✅ Успешно! Вы привязаны как {username}.\n🔑 В базе найден сохраненный токен для этого ника, он автоматически подставлен.",
                     keyboard=get_main_keyboard())
             else:
                 c.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
