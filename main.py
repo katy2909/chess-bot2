@@ -370,11 +370,12 @@ async def fetch_championship_data():
     print("=== [ЧЕМПИОНАТ] Загрузка данных... ===", flush=True)
     tournaments = await get_all_team_tournaments()
 
-    # Фильтруем по ключевым словам и завершенные (status 30)
+    # Фильтруем по ключевым словам (берем ВСЕ турниры, не только завершенные)
     champ_tours = [
         t for t in tournaments
-        if any(kw.lower() in t.get('name', '').lower() for kw in CHAMP_KEYWORDS) and t.get('status') == 30
+        if any(kw.lower() in t.get('name', '').lower() for kw in CHAMP_KEYWORDS)
     ]
+    # Сортируем по дате (от старых к новым)
     champ_tours.sort(key=lambda x: x.get('startsAt', 0))
 
     overall_points = defaultdict(int)
@@ -385,37 +386,45 @@ async def fetch_championship_data():
         t_type = t.get('type', 'arena')
         t_name = t.get('name', 'Без названия')
         t_date = format_date(t.get('startsAt'))
+        t_status = t.get('status', 0)
 
-        if t_type == 'arena':
-            url = f"https://lichess.org/api/tournament/{t_id}/results"
-        else:
-            url = f"https://lichess.org/api/swiss/{t_id}/results"
-
-        results = await fetch_lichess_ndjson(url)
+        url_link = f"https://lichess.org/{'tournament' if t_type == 'arena' else 'swiss'}/{t_id}"
 
         stage_results = []
-        # БЕРЕМ ТОЛЬКО ТОП-20
-        top_20 = results[:20]
 
-        for p in top_20:
-            rank = p.get('rank', 999)
-            username = p.get('username')
-            if username:
-                pts = get_champ_points(rank)
-                overall_points[username] += pts
-                stage_results.append({
-                    "rank": rank,
-                    "username": username,
-                    "points": pts
-                })
+        # Если турнир завершен (status 30), собираем результаты
+        if t_status == 30:
+            if t_type == 'arena':
+                url = f"https://lichess.org/api/tournament/{t_id}/results"
+            else:
+                url = f"https://lichess.org/api/swiss/{t_id}/results"
+
+            results = await fetch_lichess_ndjson(url)
+
+            # БЕРЕМ ТОЛЬКО ТОП-20
+            top_20 = results[:20]
+
+            for p in top_20:
+                rank = p.get('rank', 999)
+                username = p.get('username')
+                if username:
+                    pts = get_champ_points(rank)
+                    overall_points[username] += pts
+                    stage_results.append({
+                        "rank": rank,
+                        "username": username,
+                        "points": pts
+                    })
+            await asyncio.sleep(1)  # Пауза между запросами
 
         stages.append({
             "id": t_id,
             "name": t_name,
             "date": t_date,
+            "status": t_status,
+            "url": url_link,
             "results": stage_results
         })
-        await asyncio.sleep(1)
 
     sorted_overall = sorted(overall_points.items(), key=lambda x: x[1], reverse=True)
 
@@ -831,10 +840,13 @@ def get_champ_stages_keyboard(stages, page):
 
     for i, s in enumerate(stages[start_idx:end_idx]):
         global_idx = start_idx + i
-        short_name = s['name'][:25] + "..." if len(s['name']) > 25 else s['name']
-        keyboard.add(
-            Text(f"{short_name}", payload={"cmd": "champ_view_stage", "idx": global_idx, "page": page, "res_page": 0}),
-            color=KeyboardButtonColor.SECONDARY)
+        # Добавляем значок статуса
+        status_icon = "🏁 " if s.get('status') == 30 else "📅 "
+        short_name = s['name'][:22] + "..." if len(s['name']) > 22 else s['name']
+
+        keyboard.add(Text(f"{status_icon}{short_name}",
+                          payload={"cmd": "champ_view_stage", "idx": global_idx, "page": page, "res_page": 0}),
+                     color=KeyboardButtonColor.SECONDARY)
         keyboard.row()
 
     nav_buttons = []
@@ -1193,10 +1205,11 @@ def register_handlers(bot: Bot):
         stages = data["stages"]
 
         if not stages:
-            await message.answer("Этапы еще не сыграны.", keyboard=get_champ_main_keyboard())
+            await message.answer("Турниры чемпионата еще не созданы.", keyboard=get_champ_main_keyboard())
             return
 
-        await message.answer(f"📅 Этапы чемпионата (стр. {page + 1}):", keyboard=get_champ_stages_keyboard(stages, page))
+        await message.answer(f"📅 Этапы чемпионата (стр. {page + 1}):\n🏁 — завершен, 📅 — предстоит",
+                             keyboard=get_champ_stages_keyboard(stages, page))
 
     @bot.on.message(payload_contains={"cmd": "champ_view_stage"})
     async def champ_view_stage_handler(message: Message):
@@ -1213,17 +1226,28 @@ def register_handlers(bot: Bot):
             return
 
         stage = stages[idx]
-        results = stage["results"]
         t_name = stage["name"]
         t_date = stage["date"]
-        t_id = stage["id"]
+        t_url = stage["url"]
+        t_status = stage.get("status", 0)
+        results = stage.get("results", [])
 
+        if t_status != 30:
+            # Турнир еще не завершен
+            text = (f"🏆 {t_name}\n"
+                    f"📅 Дата проведения: {t_date}\n"
+                    f"🔗 Ссылка: {t_url}\n\n"
+                    f"⚠️ Этот турнир еще не завершен. Результаты и начисленные баллы появятся после его окончания.")
+            await message.answer(text, keyboard=get_champ_stage_view_keyboard(idx, page, 0, False))
+            return
+
+        # Если завершен - выводим таблицу
         per_page = 20
         start_idx = res_page * per_page
         end_idx = start_idx + per_page
         page_results = results[start_idx:end_idx]
 
-        text = f"🏆 {t_name}\n📅 {t_date}\n🔗 https://lichess.org/tournament/{t_id}\n\n"
+        text = f"🏆 {t_name}\n📅 {t_date}\n🔗 {t_url}\n\n"
         text += f"Результаты (места {start_idx + 1}-{min(end_idx, len(results))}):\n"
 
         for r in page_results:
@@ -1266,12 +1290,18 @@ def register_handlers(bot: Bot):
             f"📝 Введите вашу фамилию для ника {user}.\nОна будет отображаться в таблице участников перед ником.",
             keyboard=Keyboard(one_time=True).get_json())
 
-    @bot.on.message(payload_contains={"cmd": "leaders_menu"})
+    @bot.on.message(text="📊 Статистика для руководителей клуба")
     async def leaders_menu_handler(message: Message):
         user = get_user_lichess(message.from_id)
-        if not user or not await is_club_leader(user):
-            await message.answer("❌ Эта функция доступна только руководителям.")
+        if not user:
+            await message.answer("Сначала привяжите аккаунт (напишите 'Начать').")
             return
+
+        if not await is_club_leader(user):
+            await message.answer(
+                f"❌ Эта функция доступна только руководителям.\n\nВаш текущий ник: {user}\n(Проверьте, есть ли он в списке LEADER_USERNAMES в коде)")
+            return
+
         await message.answer("📊 Статистика для руководителей клуба\nВыберите раздел:",
                              keyboard=get_leaders_menu_keyboard())
 
@@ -1895,7 +1925,7 @@ def register_handlers(bot: Bot):
                 table_cache.clear()
                 api_cache.clear()
                 await message.answer(
-                    f"✅ Успешно! Вы привязаны как {username}.\n🔑 В базе найден сохраненный токен для этого ника, он автоматически подставлен.",
+                    f"✅ Успешно! Вы привязаны как {username}.\n🔑 В базе найден сохраненный токен для этого ника.",
                     keyboard=get_main_keyboard())
             else:
                 c.execute("UPDATE users SET lichess_token=NULL WHERE vk_id=?", (message.from_id,))
