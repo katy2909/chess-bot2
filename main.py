@@ -400,11 +400,6 @@ async def fetch_championship_data():
         stage_results = []
 
         # Если турнир завершен (status 30), собираем результаты
-        # Если турнир завершен (status 30), собираем результаты
-        # Если турнир завершен (status 30), собираем результаты
-        # Если турнир завершен (status 30), собираем результаты
-        # Если турнир завершен (status 30), собираем результаты
-        # Если турнир завершен (status 30), собираем результаты
         if t_status == 30:
             if t_type == 'arena':
                 results_url = f"https://lichess.org/api/tournament/{t_id}/results"
@@ -416,20 +411,18 @@ async def fetch_championship_data():
             # 1. Загружаем итоговую таблицу
             results = await fetch_lichess_ndjson(results_url)
 
-            # 2. Загружаем все партии и считаем игры для каждого игрока
+            # 2. Загружаем партии СПЕЦИАЛЬНОЙ функцией с заголовком Accept
             games_played_count = defaultdict(int)
             try:
-                games = await fetch_lichess_ndjson(games_url)
+                games = await fetch_lichess_games_ndjson(games_url)
                 for game in games:
                     white = game.get('players', {}).get('white', {}).get('user', {}).get('name')
                     black = game.get('players', {}).get('black', {}).get('user', {}).get('name')
                     if white: games_played_count[white.lower()] += 1
                     if black: games_played_count[black.lower()] += 1
             except Exception as e:
-                print(f"!!! Ошибка загрузки партий для {t_name}: {e}", flush=True)
+                print(f"!!! Ошибка обработки партий для {t_name}: {e}", flush=True)
 
-            # Страховка: если партии не загрузились (список пуст), пропускаем всех,
-            # чтобы не сломать таблицу полностью.
             games_loaded = len(games_played_count) > 0
             print(
                 f"=== [ЧЕМПИОНАТ] {t_name}: рез. {len(results)}, игр {len(games_played_count)}, загружено={games_loaded} ===",
@@ -442,7 +435,6 @@ async def fetch_championship_data():
 
                 if username and rank > 0:
                     # Если партии загрузились, проверяем, играл ли человек.
-                    # Если партии НЕ загрузились (ошибка API), берем всех с местом.
                     if not games_loaded or games_played_count.get(username.lower(), 0) > 0:
                         pts = get_champ_points(rank)
                         overall_points[username] += pts
@@ -474,7 +466,29 @@ async def fetch_championship_data():
     print("=== [ЧЕМПИОНАТ] Данные успешно загружены ===", flush=True)
     return result_data
 
-
+async def fetch_lichess_games_ndjson(url):
+    """Специальная функция для эндпоинта /games, требующего Accept: application/x-ndjson"""
+    headers = {
+        "User-Agent": "VK-ChessClubBot/1.0",
+        "Accept": "application/x-ndjson"  # Ключевой заголовок
+    }
+    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 429:
+                    await asyncio.sleep(5)
+                    continue
+                resp.raise_for_status()
+                results = []
+                for line in resp.text.strip().split('\n'):
+                    if line.strip():
+                        results.append(json.loads(line))
+                return results
+            except Exception as e:
+                print(f"!!! Ошибка загрузки игр ({attempt+1}/3): {e}", flush=True)
+                await asyncio.sleep(2)
+        return []
 # =====================================================================
 # СБОР ДАННЫХ ДЛЯ ТАБЛИЦЫ И СТАТИСТИКИ КЛУБА
 # =====================================================================
