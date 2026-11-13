@@ -1311,8 +1311,8 @@ def register_handlers(bot: Bot):
         text = f"🏆 {t_name}\n📅 {t_date}\n🔗 {t_url}\n\n"
         text += f"Результаты (места {start_idx + 1}-{min(end_idx, len(results))}):\n"
 
-        for r in page_results:
-            text += f"{r['rank']}. {r['username']} — {r['points']} баллов\n"
+        for i, r in enumerate(page_results, start_idx + 1):
+            text += f"{i}. {r['username']} — {r['points']} баллов\n"
 
         has_next = len(results) > end_idx
         await message.answer(text, keyboard=get_champ_stage_view_keyboard(idx, page, res_page, has_next))
