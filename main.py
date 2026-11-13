@@ -404,6 +404,7 @@ async def fetch_championship_data():
         # Если турнир завершен (status 30), собираем результаты
         # Если турнир завершен (status 30), собираем результаты
         # Если турнир завершен (status 30), собираем результаты
+        # Если турнир завершен (status 30), собираем результаты
         if t_status == 30:
             if t_type == 'arena':
                 results_url = f"https://lichess.org/api/tournament/{t_id}/results"
@@ -418,36 +419,39 @@ async def fetch_championship_data():
             # 2. Загружаем все партии и считаем игры для каждого игрока
             games_played_count = defaultdict(int)
             try:
-                # Получаем поток партий (NDJSON)
                 games = await fetch_lichess_ndjson(games_url)
                 for game in games:
-                    # Учитываем партию для обоих участников
                     white = game.get('players', {}).get('white', {}).get('user', {}).get('name')
                     black = game.get('players', {}).get('black', {}).get('user', {}).get('name')
-                    if white: games_played_count[white] += 1
-                    if black: games_played_count[black] += 1
+                    if white: games_played_count[white.lower()] += 1
+                    if black: games_played_count[black.lower()] += 1
             except Exception as e:
                 print(f"!!! Ошибка загрузки партий для {t_name}: {e}", flush=True)
 
+            # Страховка: если партии не загрузились (список пуст), пропускаем всех,
+            # чтобы не сломать таблицу полностью.
+            games_loaded = len(games_played_count) > 0
             print(
-                f"=== [ЧЕМПИОНАТ] Турнир {t_name}: получено {len(results)} результатов, сыграно {sum(games_played_count.values())} партий ===",
+                f"=== [ЧЕМПИОНАТ] {t_name}: рез. {len(results)}, игр {len(games_played_count)}, загружено={games_loaded} ===",
                 flush=True)
 
-            # 3. Начисляем очки только тем, кто сыграл хотя бы одну партию
+            # 3. Начисляем очки
             for p in results:
                 rank = p.get('rank', 0)
                 username = p.get('username')
 
-                # Проверяем, есть ли игрок в списке сыгравших
-                if username and rank > 0 and games_played_count.get(username, 0) > 0:
-                    pts = get_champ_points(rank)
-                    overall_points[username] += pts
-                    stage_results.append({
-                        "rank": rank,
-                        "username": username,
-                        "points": pts
-                    })
-            await asyncio.sleep(1)  # Пауза, чтобы не превышать лимиты API
+                if username and rank > 0:
+                    # Если партии загрузились, проверяем, играл ли человек.
+                    # Если партии НЕ загрузились (ошибка API), берем всех с местом.
+                    if not games_loaded or games_played_count.get(username.lower(), 0) > 0:
+                        pts = get_champ_points(rank)
+                        overall_points[username] += pts
+                        stage_results.append({
+                            "rank": rank,
+                            "username": username,
+                            "points": pts
+                        })
+            await asyncio.sleep(1)
 
         stages.append({
             "id": t_id,
