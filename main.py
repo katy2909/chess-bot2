@@ -100,8 +100,12 @@ champ_cache = {}  # Кэш для чемпионата
 def format_date(ts):
     if not ts: return "Неизвестно"
     try:
-        return datetime.fromtimestamp(ts / 1000).strftime('%d.%m.%Y %H:%M')
-    except:
+        # Устанавливаем часовой пояс МСК (UTC+3)
+        msk_tz = timezone(timedelta(hours=3))
+        # Переводим время из UTC в МСК
+        dt = datetime.fromtimestamp(ts / 1000, tz=msk_tz)
+        return dt.strftime('%d.%m.%Y %H:%M')
+    except Exception:
         return "Неизвестно"
 
 
