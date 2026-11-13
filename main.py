@@ -400,6 +400,7 @@ async def fetch_championship_data():
         stage_results = []
 
         # Если турнир завершен (status 30), собираем результаты
+        # Если турнир завершен (status 30), собираем результаты
         if t_status == 30:
             if t_type == 'arena':
                 url = f"https://lichess.org/api/tournament/{t_id}/results"
@@ -407,16 +408,19 @@ async def fetch_championship_data():
                 url = f"https://lichess.org/api/swiss/{t_id}/results"
 
             results = await fetch_lichess_ndjson(url)
-
-            # Выводим в консоль, сколько результатов пришло (для проверки)
             print(f"=== [ЧЕМПИОНАТ] Турнир {t_name}: получено {len(results)} результатов ===", flush=True)
 
             for p in results:
                 rank = p.get('rank', 0)
                 username = p.get('username')
 
-                # Условие: есть ник, есть место (не 0), и начисляем очки
-                if username and rank > 0:
+                # Безопасно достаем количество игр и очки
+                nb_data = p.get('nb', {})
+                games_played = nb_data.get('game', 0) if isinstance(nb_data, dict) else 0
+                score = p.get('score', 0)
+
+                # Условие: есть ник, есть место, и (сыграна хотя бы 1 игра ИЛИ есть очки)
+                if username and rank > 0 and (games_played > 0 or score > 0):
                     pts = get_champ_points(rank)
                     overall_points[username] += pts
                     stage_results.append({
