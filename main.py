@@ -404,13 +404,17 @@ async def fetch_championship_data():
 
             results = await fetch_lichess_ndjson(url)
 
-            # БЕРЕМ ТОЛЬКО ТОП-20
-            top_20 = results[:20]
-
-            for p in top_20:
+            # Берем ВСЕХ участников турнира
+            for p in results:
                 rank = p.get('rank', 999)
                 username = p.get('username')
-                if username:
+
+                # Проверяем количество сыгранных партий (Lichess отдает это в поле 'nb')
+                nb_data = p.get('nb', {})
+                games_played = nb_data.get('game', nb_data.get('games', 0))
+
+                # Условие: ник существует и сыграна хотя бы 1 партия
+                if username and games_played > 0:
                     pts = get_champ_points(rank)
                     overall_points[username] += pts
                     stage_results.append({
